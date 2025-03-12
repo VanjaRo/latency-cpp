@@ -3,4 +3,4 @@
 # This is a temporary dummy script
 
 set -euo pipefail
-echo 1000
+echo 900
