@@ -1,93 +1,158 @@
-# latency-spring-2025
+# Latency Spring 2025
 
+## Описание задачи
 
+Подробное описание будет дано на вступительной лекции. Здесь приведены лишь основные моменты, а также ряд технических деталей, не покрытых в лекции.
 
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://gitlab.spectral.tech/study/latency-spring-2025.git
-git branch -M main
-git push -uf origin main
+В рамках соревнования вам нужно написать программу, которая получает данные по ордербукам по многим инструментам и поддерживает корректные ордербуки по заданному заранее подмножеству инструментов. В ордербуке необходимо корректно поддерживать первые 5 уровней. Обозначим уровни цен для асков как $p_1^a, p_2^a, ..., p_5^a$ и аналогично для бидов $p_i^b$. Обозначим также объемы, на соответствующих уровнях как $q_1^a, ..., q_5^a$. Вам необходимо подсчитывать _имбаланс_, считаемый как
+```math
+Imb = \frac{\sum_{i=0}^{5} q_i^b - \sum_{i=0}^5 q_i^a}{\sum_{i=0}^5 q_i^b + \sum_{i=0}^5 q_i^a} 
 ```
 
-## Integrate with your tools
+## Формат данных
 
-- [ ] [Set up project integrations](https://gitlab.spectral.tech/study/latency-spring-2025/-/settings/integrations)
+### Сетевой стек
 
-## Collaborate with your team
+Входные данные подаются в виде udp трафика, записанного в pcap файлах. Исходный протокол используется на реальных биржах, но был немного изменен для целей данного соревнования. Также в рамках проекта ряд полей в данных были изменены (ip и mac адреса, названия инструментов и т.д.). В остальном же данные максимально близки к записи сырого сетевого трафика.
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+Каждый udp пакет содержит только один eth фрейм. Каждый фрейм в данных содержит информацию с обновлениями ордербуков по одному или нескольким инструментам. Помимо этого встречаются и данные других типов, но в рамках этого проекта их можно пропускать.
 
-## Test and Deploy
+Поскольку разных инструментов в данных много (несколько тысяч), то обновления ордербуков по всем могут занимать много фреймов. Однако, **гарантируется, что в рамках одного фрейма для каждого инструмента в этом фрейме
+содержится полное обновление ордербука**. Иными словами, после обработки каждого фрейма все ордербуки находятся в валидном состоянии.
 
-Use the built-in continuous integration in GitLab.
+### Протокол данных
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+Здесь описан непосредственно протокол кодирования данных (т.е. содержимое udp payload, т.е. Application Layer). В описании помимо понятных названий типов вроде int32 или uint32 будет встречаться vint. Последний представляет собой схему кодирования знаковых 64-битных чисел, используя переменное число байт (от 1 до 10).
 
-***
+vint сначала кодирует число в беззнаковое 64-битное с помощью ZigZag, а затем полученное беззнаковое число кодируется с помощью varint. В целом, vint совпадает с sint64 из Google Protocol Buffers, его описание может быть найдено здесь: https://protobuf.dev/programming-guides/encoding/.
 
-# Editing this README
+Таким образом, для декодирования vint нужно сделать все в обратном порядке:
+- декодировать varint, описание которого можно найти здесь: https://protobuf.dev/programming-guides/encoding/#varints
+- декодировать ZigZag, описание которого можно найти здесь: https://protobuf.dev/programming-guides/encoding/#signed-ints
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+**Все числа в протоколе записаны в little-endian. Выравнивание не используется ни для каких полей.**
 
-## Suggestions for a good README
+Также в типах встречается `char[n]`. Данный тип кодирует 0-terminated строку длиной не более `n-1` (т.е. тип занимает ровно `n` байт, чтобы прочитать строку, нужно читать до первого нулевого байта).
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+#### Структура данных
 
-## Name
-Choose a self-explaining name for your project.
+Каждый фрейм может содержать один или более пакет с данными ("пакет" в Application Layer).
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+Каждый пакет с данными состоит из хедера и следующего непосредственно за ним содержимого пакета. Хедер задает описание пакета и представляет собой набор типизированных записей. В начале всегда следуют следующие 3 записи:
+- `uint8 flag`
+- `uintp typeid` - тип сообщения, по нему можно определить сообщение какого типа далее следует.
+- `uint16 length` - длина сообщения (без учета хедера). Можно использовать, чтобы понимать, где заканчивается очередной пакет (например, если его нужно просто пропустить).
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+В рамках проекта нас интересуют только сообщениях двух типов: снепшоты (`typeid=0x32`) и инкрементальные апдейты
+(`typeid=0x01`).
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+Содержимое пакета после хедера представляет собой последовательность _полей_. Каждое _поле_ также состоит из хедера и содержимого поля. Хедер любого поля состоит из 2 чисел:
+- `uint16 field_id` - задает тип поля
+- `uint16 field_len` - длина содержимого поля
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+Содержимое поля представляет собой последовательность типизированных записей (как в хедере) и зависит от типа поля.
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+#### Снепшоты (typeid=0x32)
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+Снепшот содержит большое количество полей, однако большая их часть в рамках проекта нам не интересна. Для таких полей указано только field_id и field_size, чтобы их можно было пропустить. Поля следуют в таком порядке:
+- `field_id=0x0032, field_size=9` (может быть несколько таких полей или 0)
+- `field_id=0x0031, field_size=22`
+- `field_id=0x1001, field_size=6` 
+- `field_id=0x1003, field_size=37`
+- `field_id=0x1002, field_size=22`
+- Incremental packet field (`field_id=0x1004`). Включает в себя:
+  - `int32 packet_no` - номер последнего инкрементального апдейта в снепшоте. Фактически означает, что в данный снепшот уже включены все апдейты с номерами не больше заданного (используется при мерже снепшотов и апдейтов, описано далее).
+- Instrument information field (`field_id=0x0101`). Содержит общую информацию об инструменте, включает в себя:
+  - `char[31] intrument_id` - текстовое название инструмента.
+  - 61 байт, с информацией, которая нам не нужна
+  - `double tick_size` - любая цена для этого инструмента должна быть множителем tick_size.
+  - `double reference_price` - базовая цена, от которой отсчитываются смещения в инкрементальных апдейтах.
+  - `int32 instrument_no` - код инструмента, который в дальнейшем используется в апдейтах для идентификации инструмента.
+- `field_id=0x0102, field_size=154`
+- Непосредственно содержимое ордербука (`field_id=0x0103`). Состоит из не более, чем 2N записей следующего вида:
+  - `int32 instrument_no` - номер инструмента, совпадает с таковым в information field.
+  - `char direction` - '0' для бидов и '1' для асков.
+  - `double price` - уровень цены (абсолютный)
+  - `int32 volume` - объем на данной цене.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+#### Инкрементальные апдейты (typeid=0x01)
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+Каждый апдейт содержит поле с хедером, какое-то количество полей с непосредственно обновлениями ордербука (может быть и нулевое), а также может содержать summary-поля, которые нас не интересуют.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+Поле с хедером (`field_id=0x0003`) содержит:
+- `vint instrument_no` - код инструмента, по которому идут дальнейшие поля в рамках этого апдейта
+- `vint change_no` - номер инкремента, используется для корректного мержа снепшотов и апдейтов (описано далее)
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+Непосредственно поле с обновлениями (`field_id=0x1001`) содержит:
+- `char event_type`. '1' при добавлении нового уровня, '2' при изменении существующего, '3' при удалении уровня.
+- `char md_entry_type`. '0' если это обновление бидов, '1' если асков.
+- `vint price_level`. Номер уровня цены (индексация с 1), где необходимо применить изменение.
+- `vint price_offset`. Непосредственно уровень цены. Задается как прибавка, которую нужно добавить к reference price из снепшота для текущего инструмента. Т.е. если данное значение равно `n`, то реальный уровень цены равен `reference + n * tick_size`.
+- `vint volume` - объем на данном уровне цены.
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+**Обратите внимание на следующие особенности:**
+1. В процессе применения индивидуальных обновлений (с `field_id=0x1001`) ордербук может находиться в некорректном состоянии. Его корректность гарантируется только по завершению всего апдейта.
+2. Несмотря на то, что нас интересуют только первые 5 уровней ордербука (и только информация по ним будет во входных данных), необходимо поддерживать ордербук и дальше этой глубины, т.к. более глубокие уровни могут войти в первые 5 в случае удалений например.
 
-## License
-For open source projects, say how it is licensed.
+summary-поля включают в себя поля с field_id из списка (0x1002, 0x1011, 0x1012, 0x1013, 0x1014, 0x1015, 0x1016). Каждый field_id может встречаться не более 1 раза в рамках апдейта.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+### Как правильно поддерживать ордербук
+
+Ордербуки по разным инструментам независимы друг от друга. В общем алгоритм состоит в последовальном чтении снепшотов и апдейтов, и применении апдейтов поверх текущего состояния ордербука. Особенность состоит в том, что иногда необходимо восстанавливать ордербук из снепшота заново (например, в начале считывания данных, при потере каких-то апдейтов или же просто при получении нового снепшота).
+
+Для синхронизации снепшотов и апдейтов используюся поля `packet_no` в снепшоте и `change_no` в апдейтах. При применении апдейтов если очередной `change_no` не равен предыдущему+1, то необходимо пропустить все апдейты до следующего снепшота (фактически, часть данных была потеряна).
+
+После применения снепшота применять апдейты к нему стоит начинать только когда `change_no = packet_no + 1`.
+
+## Основные части окружения
+
+Окружение проекта включает в себя:
+- сырые данные
+- ваше решение
+- бинарь (runner), взаимодействующий с вашим решением. runner запускает решение как дочерний процесс, читает данные из pcap файлов и подает их на вход в shared memory, а также вычитывает вывод решения из shared memory. Также производит замеры времени.
+
+runner не имеет никаких динамических зависимостей и может быть запущен на любой достаточно свежей linux-системе. Если в вашем случае это не так, то вы можете использовать докер для запуска, достаточно образа с `ubuntu:22.04` или новее. В случае запуска в докере крайне рекомендуется использовать флаг `--ipc=host`.
+
+## Формат решения
+
+### Формат ввода-вывода
+
+Общение между runner и решением происходит с помощью двух single-producer-single-consumer очередей. Каждая очередь задается двумя файлами в /dev/shm: хедером и буфером. Формат хедера может быть описан следующим образом:
+
+```c++
+struct spsc_header_t {
+    alignas(64) std::atomic<uint32_t> producer_offset;
+    alignas(64) std::atomic<uint32_t> consumer_offset;
+};
+```
+
+Т.е. хедер ключает в себя текущие оффсеты писателя и читателя в буфере, выровненные по границе 64 байт.
+Буфер размера `N` байт (этот размер передается в решение отдельно) представляет собой в реальности файл размера `2N` в shared memory. Это сделано для того, чтобы можно было удобно закольцевать данные в буфере.
+
+При запуске решения runner сам создаст нужные файлы и проинициализирует оффсеты в 0. Протокол общения устроен следующим образом (пусть размер буфера равен `N` как в примере выше):
+
+- для записи `k` байт producer берет текущий producer_offset по модулю `N`, после чего пишет `k` байт, начиная с данной позиции. По завершению producer_offset увеличивается на `k`.
+- для чтения consumer берет текущий consumer_offset и сравнивает с producer_offset. Если последний больше на `t` байт, это означает, что с `consumer_offset % N` можно прочитать `t` байт. По завершению чтения consumer_offset должен быть увеличен на `t`.
+
+Гарантируется, что `N` это всегда степень двойки. Также обратите внимание, что оффсеты в хедере хранятся в абсолютном значении, взятие по модулю производится уже непосредственно при чтении/записи в буфер. За счет того, что `N` всегда является степенью двойки, переполнения `uint32_t` тут не влияют на корректность.
+
+### Работа с pcap файлами
+
+Для просмотра данных в pcap файлах лучше всего подходит Wireshark. У него есть консольный аналог tshark, но последний не очень удобен для интерактивной работы с данными. Промежуточным вариантом между двумя является termshark (https://github.com/gcla/termshark), который предоставляет консольный интерфейс.
+
+Для упрощения дебага перед взаимодействием с раннером рекомендуется отладить свое решение, напрямую работая с pcap файлами. Для чтения pcap из C++ можно использовать одну из двух библиотек:
+- libpcap (и пример использования https://elf11.github.io/2017/01/22/libpcap-in-C.html)
+- LightPcapNg (https://github.com/rvelea/LightPcapNg и пример использования в тестах https://github.com/rvelea/LightPcapNg/blob/master/src/tests/test_read_packets.c)
+
+### Требования к решению
+
+В вашем репозитории должен находиться скрипт `build.sh`, который запускает сборку. По итогу должен быть создан бинарь `solution`, который должен удовлетворять требованиям, описанным выше.
+
+## Как устроено тестирование на сервере
+
+- Машина для тестирования:
+- Тактовая частота:
+- TSc_MZ
+- hyper-threading отключен
+
+Параллельно на сервере может быть запущено не более, чем 4 решения. Каждое решение запускается на своем подмножестве изолированных ядер. Помимо этого L3 кеш поделен на 5 равных частей с помощью resctrl (4 для решений и 1 для самой системы), т.е. каждому решению доступно ~9MB L3 кеша.
