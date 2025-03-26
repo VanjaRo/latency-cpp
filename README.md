@@ -9,6 +9,10 @@
 VWAP = \frac{\sum_{i=0}^{5} p_i^a \cdot q_i^a + p_i^b \cdot q_i^b}{\sum_{i=0}^{5} q_i^a + q_i^b} 
 ```
 
+Публичные данные доступны по ссылке: https://drive.google.com/file/d/1UQ7j7bBomu1fHSqJRxnOORKCbfk_3z1f/view?usp=sharing
+
+Лидерборд: https://lat.spectral.tech/
+
 ## Формат данных
 
 ### Сетевой стек
