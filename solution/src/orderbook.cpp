@@ -1,11 +1,11 @@
 #include "orderbook.h"
-#include "pcap_reader.h"
+#include "pcap_reader.h" // For ipStringToUint32 if used
 #include "protocol_logger.h"
-#include <algorithm>
+#include <algorithm> // For std::sort, std::find_if
 #include <cstdint>
-#include <fstream>
-#include <iostream>
-#include <sstream>
+#include <fstream> // For std::ifstream in loadMetadata
+#include <sstream> // For std::istringstream in loadMetadata
+#include <vector>  // For std::vector in cachedParsedUpdates and getChangedVWAPs
 
 // Orderbook constructor
 Orderbook::Orderbook()
@@ -26,8 +26,7 @@ Orderbook::Orderbook()
 }
 
 // OrderbookManager constructor
-OrderbookManager::OrderbookManager()
-    : currentInstrumentId(0), snapshotIP(0), updateIP(0) {
+OrderbookManager::OrderbookManager() : snapshotIP(0), updateIP(0) {
   LOG_INFO("OrderbookManager created.");
 }
 
@@ -47,7 +46,8 @@ void OrderbookManager::loadMetadata(const std::string &metadataPath) {
     std::istringstream iss(line);
     std::string ip1, ip2;
     if (iss >> ip1 >> ip2) {
-      snapshotIP = ipStringToUint32(ip1);
+      snapshotIP =
+          ipStringToUint32(ip1); // Assumes ipStringToUint32 is available
       updateIP = ipStringToUint32(ip2);
       LOG_INFO("Loaded IPs: snapshot=", ip1, " update=", ip2);
     } else {
@@ -99,8 +99,8 @@ bool OrderbookManager::isRelevantIP(uint32_t ip) const {
   return ip == snapshotIP || ip == updateIP;
 }
 
-// Process instrument snapshot
-void OrderbookManager::processSnapshot(const InstrumentInfo &info) {
+// Process instrument info part of a snapshot
+void OrderbookManager::processSnapshotInfo(const InstrumentInfo &info) {
   // Get instrument name and trim any trailing spaces
   std::string instrName(info.name);
   instrName.erase(
@@ -109,59 +109,60 @@ void OrderbookManager::processSnapshot(const InstrumentInfo &info) {
           .base(),
       instrName.end());
 
-  LOG_DEBUG("Processing snapshot for instrument '", instrName,
+  LOG_DEBUG("Processing snapshot info for instrument '", instrName,
             "' (ID: ", info.instrumentId, ")");
 
   // Skip if not tracked
   if (!isTrackedInstrument(instrName)) {
     LOG_TRACE("Skipping untracked instrument: '", instrName, "'");
+    // Clear any potentially cached updates for this untracked ID
+    cachedParsedUpdates.erase(info.instrumentId);
     return;
   }
 
-  LOG_INFO("Creating/updating orderbook for tracked instrument '", instrName,
+  LOG_INFO("Applying snapshot for tracked instrument '", instrName,
            "' (ID: ", info.instrumentId, ")");
 
-  // Create or update orderbook entry
-  auto &orderbook = orderbooks[info.instrumentId];
+  // Create or get orderbook entry
+  auto &orderbook = orderbooks[info.instrumentId]; // Creates if not exists
+
+  // Reset orderbook state based on snapshot info
   orderbook.instrumentId = info.instrumentId;
   orderbook.tickSize = info.tickSize;
   orderbook.referencePrice = info.referencePrice;
   orderbook.changeNo = info.changeNo;
-  orderbook.isValid = true;
-  orderbook.askCount = 0;
+  orderbook.isValid = true; // Mark as valid *after* applying snapshot base info
+  orderbook.askCount = 0;   // Clear existing levels
   orderbook.bidCount = 0;
-  orderbook.vwapNumerator = 0;
+  for (auto &level : orderbook.asks)
+    level = {0.0, 0}; // Reset array elements
+  for (auto &level : orderbook.bids)
+    level = {0.0, 0};          // Reset array elements
+  orderbook.vwapNumerator = 0; // Reset VWAP components
   orderbook.vwapDenominator = 0;
-  orderbook.lastVwapNumerator = 0;
+  orderbook.lastVwapNumerator = 0; // Reset history
   orderbook.lastVwapDenominator = 0;
-  orderbook.vwapChanged = false;
+  orderbook.vwapChanged = false; // Reset flag
 
   // Track ID to name mapping
   idToName[info.instrumentId] = instrName;
 
-  // Set current instrument ID for orderbook updates
-  currentInstrumentId = info.instrumentId;
+  LOG_DEBUG("Initialized/Reset orderbook from snapshot info: ID=",
+            info.instrumentId, " ChangeNo=", info.changeNo,
+            " TickSize=", info.tickSize, " RefPrice=", info.referencePrice);
 
-  LOG_DEBUG("Initialized orderbook: ID=", info.instrumentId,
-            " ChangeNo=", info.changeNo, " TickSize=", info.tickSize,
-            " RefPrice=", info.referencePrice);
+  // VWAP calculation and cached update application happen in finalizeSnapshot
 }
 
 // Process orderbook entry from snapshot
 void OrderbookManager::processSnapshotOrderbook(int32_t instrumentId, Side side,
                                                 double price, int32_t volume) {
-  // Find the orderbook
+  // Find the orderbook - it must exist if processSnapshotInfo was called for a
+  // tracked instrument
   auto it = orderbooks.find(instrumentId);
-  if (it == orderbooks.end()) {
-    LOG_WARN("Received snapshot orderbook entry for unknown instrument ID: ",
+  if (it == orderbooks.end() || !isTrackedInstrumentId(instrumentId)) {
+    LOG_WARN("Received snapshot OB entry for unknown/untracked ID: ",
              instrumentId);
-    return;
-  }
-  if (!it->second.isValid) {
-    LOG_WARN(
-        "Received snapshot orderbook entry for invalid/uninitialized orderbook "
-        "ID: ",
-        instrumentId);
     return;
   }
 
@@ -171,148 +172,256 @@ void OrderbookManager::processSnapshotOrderbook(int32_t instrumentId, Side side,
             " Side=", sideStr, " Price=", price, " Volume=", volume);
 
   if (side == Side::BID) {
-    // Add to bids if there's space
     if (orderbook.bidCount < MAX_PRICE_LEVELS) {
-      orderbook.bids[orderbook.bidCount].price = price;
-      orderbook.bids[orderbook.bidCount].volume = volume;
-      orderbook.bidCount++;
-      LOG_TRACE("Added BID level ", orderbook.bidCount, " Price=", price,
-                " Vol=", volume);
+      orderbook.bids[orderbook.bidCount++] = {
+          price, static_cast<int64_t>(volume)}; // Cast volume
     } else {
-      LOG_WARN("Max BID levels reached for ID: ", instrumentId);
+      LOG_WARN("Snapshot provides more than MAX_PRICE_LEVELS BIDs for ID: ",
+               instrumentId);
     }
-  } else if (side == Side::ASK) {
-    // Add to asks if there's space
+  } else { // ASK
     if (orderbook.askCount < MAX_PRICE_LEVELS) {
-      orderbook.asks[orderbook.askCount].price = price;
-      orderbook.asks[orderbook.askCount].volume = volume;
-      orderbook.askCount++;
-      LOG_TRACE("Added ASK level ", orderbook.askCount, " Price=", price,
-                " Vol=", volume);
+      orderbook.asks[orderbook.askCount++] = {
+          price, static_cast<int64_t>(volume)}; // Cast volume
     } else {
-      LOG_WARN("Max ASK levels reached for ID: ", instrumentId);
+      LOG_WARN("Snapshot provides more than MAX_PRICE_LEVELS ASKs for ID: ",
+               instrumentId);
     }
   }
-
-  // Calculate VWAP after each update
-  calculateVWAP(orderbook);
 }
 
-// Process update header
-void OrderbookManager::processUpdateHeader(const UpdateHeader &header) {
-  LOG_TRACE("Processing update header: ID=", header.instrumentId,
-            " ChangeNo=", header.changeNo);
-
-  // Find the orderbook
-  auto it = orderbooks.find(header.instrumentId);
-  if (it == orderbooks.end()) {
-    LOG_DEBUG("Skipping update header for unknown instrument ID: ",
-              header.instrumentId);
-    currentInstrumentId = -1; // Invalidate context
+// Finalize snapshot processing for a given instrument
+void OrderbookManager::finalizeSnapshot(int32_t instrumentId) {
+  auto it = orderbooks.find(instrumentId);
+  if (it == orderbooks.end() || !it->second.isValid) {
+    LOG_ERROR("Finalize snapshot called for unknown or invalid ID: ",
+              instrumentId);
     return;
   }
-
   Orderbook &orderbook = it->second;
 
-  // Check if this update is in sequence
-  if (!orderbook.isValid || header.changeNo != orderbook.changeNo + 1) {
-    LOG_WARN("Out-of-sequence update for ID: ", header.instrumentId,
-             " Received=", header.changeNo,
-             " Expected=", orderbook.changeNo + 1);
-    // Here, we might need logic to invalidate the book or wait for a snapshot.
-    // For now, just skip processing events related to this header.
-    currentInstrumentId = -1; // Invalidate context
-    return;
-  }
+  LOG_DEBUG("Finalizing snapshot application for ID: ", instrumentId,
+            " Bid Levels=", orderbook.bidCount,
+            " Ask Levels=", orderbook.askCount);
 
-  // Update the orderbook change number
-  orderbook.changeNo = header.changeNo;
+  // 1. Calculate initial VWAP based on the now populated snapshot levels
+  calculateVWAP(orderbook);
 
-  // Set current instrument ID for update events
-  currentInstrumentId = header.instrumentId;
-
-  // Store current VWAP values
+  // 2. Store this initial VWAP state as the baseline "last" state
   orderbook.lastVwapNumerator = orderbook.vwapNumerator;
   orderbook.lastVwapDenominator = orderbook.vwapDenominator;
   orderbook.vwapChanged = false;
 
-  LOG_DEBUG("Update header accepted for ID: ", header.instrumentId,
-            " New ChangeNo=", orderbook.changeNo);
+  LOG_DEBUG("Initial VWAP calculated post-snapshot for ID ", instrumentId, ": ",
+            orderbook.vwapNumerator, "/", orderbook.vwapDenominator);
+
+  // 3. Attempt to apply any relevant cached updates
+  applyCachedUpdates(orderbook);
 }
 
-// Process update event
-void OrderbookManager::processUpdateEvent(const UpdateEvent &event) {
-  if (event.instrumentId != currentInstrumentId) {
-    LOG_WARN("Skipping update event for mismatched instrument ID. Expected=",
-             currentInstrumentId, " Got=", event.instrumentId);
-    return;
+// Applies cached updates after a snapshot or potentially during recovery
+void OrderbookManager::applyCachedUpdates(Orderbook &orderbook) {
+  auto cacheIt = cachedParsedUpdates.find(orderbook.instrumentId);
+  if (cacheIt == cachedParsedUpdates.end() || cacheIt->second.empty()) {
+    return; // No cached updates
   }
 
-  // Find the orderbook using the event's instrument ID
-  auto it = orderbooks.find(event.instrumentId);
-  if (it == orderbooks.end() || !it->second.isValid) {
-    std::cout << "Skipping update for unknown/invalid instrument ID: "
-              << event.instrumentId << std::endl;
-    return;
-  }
+  LOG_INFO("Applying cached updates for ID: ", orderbook.instrumentId,
+           " Current ChangeNo: ", orderbook.changeNo,
+           " Cached Count: ", cacheIt->second.size());
 
-  Orderbook &orderbook = it->second;
-  auto nameIt = idToName.find(event.instrumentId);
-  std::string instrName =
-      (nameIt != idToName.end()) ? nameIt->second : "unknown";
+  auto &cachedQueue = cacheIt->second;
+  std::sort(cachedQueue.begin(), cachedQueue.end()); // Sort by changeNo
 
-  // Calculate the actual price using reference price and tick size
-  double price =
-      orderbook.referencePrice + (event.priceOffset * orderbook.tickSize);
+  size_t appliedCount = 0;
+  auto queue_it = cachedQueue.begin(); // Use different iterator name
 
-  const char *eventTypeStr =
-      (event.eventType == EventType::ADD      ? "ADD"
-       : event.eventType == EventType::MODIFY ? "MODIFY"
-                                              : "DELETE");
-  const char *sideStr = (event.side == Side::BID) ? "BID" : "ASK";
-
-  LOG_TRACE("Processing update event: ID=", event.instrumentId,
-            " Type=", eventTypeStr, " Side=", sideStr,
-            " Level=", event.priceLevel, " Price=", price,
-            " (Ref=", orderbook.referencePrice, " + Offset=", event.priceOffset,
-            " * Tick=", orderbook.tickSize, ")", " Vol=", event.volume);
-
-  // Validate price level index (protocol uses 1-based)
-  int priceLevelIndex = event.priceLevel - 1;
-  if (priceLevelIndex < 0) {
-    LOG_ERROR("Invalid price level index (0 or negative): ", event.priceLevel);
-    return; // Skip invalid event
-  }
-
-  try {
-    switch (event.eventType) {
-    case EventType::ADD:
-      addPriceLevel(orderbook, event.side, priceLevelIndex, price,
-                    event.volume);
+  while (queue_it != cachedQueue.end()) {
+    if (!orderbook.isValid) {
+      LOG_WARN("Orderbook ID ", orderbook.instrumentId,
+               " became invalid during cached update application. Stopping.");
       break;
-    case EventType::MODIFY:
-      modifyPriceLevel(orderbook, event.side, priceLevelIndex, price,
-                       event.volume);
-      break;
-    case EventType::DELETE:
-      deletePriceLevel(orderbook, event.side, priceLevelIndex);
-      break;
-    default:
-      // Should not happen if parser validation is correct
-      LOG_ERROR("Unknown event type received: ",
-                static_cast<char>(event.eventType));
-      return;
     }
-  } catch (const std::out_of_range &e) {
-    LOG_ERROR("Error processing price level index: ", priceLevelIndex + 1,
-              " - ", e.what());
-    // Depending on severity, might invalidate orderbook or just skip event
+
+    if (queue_it->changeNo == orderbook.changeNo + 1) {
+      LOG_INFO("Applying cached update ID: ", orderbook.instrumentId,
+               " ChangeNo: ", queue_it->changeNo);
+
+      // Store state *before* applying this cached update
+      orderbook.lastVwapNumerator = orderbook.vwapNumerator;
+      orderbook.lastVwapDenominator = orderbook.vwapDenominator;
+      orderbook.vwapChanged = false;
+
+      for (const auto &event : queue_it->events) {
+        if (orderbook.tickSize <= 0) {
+          LOG_WARN("Invalid tick size while applying cached update for ID ",
+                   orderbook.instrumentId, ". Skipping event.");
+          continue;
+        }
+        double price =
+            orderbook.referencePrice + (event.priceOffset * orderbook.tickSize);
+        int priceLevelIndex =
+            event.priceLevel - 1; // Convert 1-based to 0-based
+
+        if (priceLevelIndex < 0) {
+          LOG_ERROR("Invalid cached price level index: ", event.priceLevel);
+          continue;
+        }
+        try {
+          switch (event.eventType) {
+          case EventType::ADD:
+            addPriceLevel(orderbook, event.side, priceLevelIndex, price,
+                          event.volume);
+            break;
+          case EventType::MODIFY:
+            modifyPriceLevel(orderbook, event.side, priceLevelIndex, price,
+                             event.volume);
+            break;
+          case EventType::DELETE:
+            deletePriceLevel(orderbook, event.side, priceLevelIndex);
+            break;
+          default:
+            LOG_ERROR("Unknown event type in cached update: ",
+                      static_cast<char>(event.eventType));
+            break;
+          }
+        } catch (const std::out_of_range &e) {
+          LOG_ERROR("Error processing cached price level index: ",
+                    priceLevelIndex + 1, " for ID ", orderbook.instrumentId);
+        }
+      }
+
+      orderbook.changeNo = queue_it->changeNo;
+      calculateVWAP(
+          orderbook); // Recalculate VWAP and set vwapChanged if needed
+
+      // Remove from cache (iterator invalidation - erase and advance)
+      queue_it = cachedQueue.erase(queue_it);
+      appliedCount++;
+
+    } else if (queue_it->changeNo <= orderbook.changeNo) {
+      LOG_WARN("Discarding old/duplicate cached update for ID: ",
+               orderbook.instrumentId, " Cached ChangeNo: ", queue_it->changeNo,
+               " Book ChangeNo: ", orderbook.changeNo);
+      queue_it = cachedQueue.erase(queue_it);
+    } else { // Gap detected
+      LOG_INFO(
+          "Stopping cached update application for ID: ", orderbook.instrumentId,
+          " Gap detected. Expected: ", orderbook.changeNo + 1,
+          " Found: ", queue_it->changeNo);
+      break; // Since sorted, no more can apply
+    }
+  }
+
+  LOG_INFO("Finished applying cached updates for ID: ", orderbook.instrumentId,
+           ". Applied ", appliedCount,
+           " updates. Remaining cached: ", cachedQueue.size());
+  if (cachedQueue.empty()) {
+    cachedParsedUpdates.erase(cacheIt);
+  }
+}
+
+// Process a fully parsed update message (header + events)
+void OrderbookManager::handleUpdateMessage(
+    const UpdateHeader &header,
+    const std::vector<CachedParsedUpdateEvent> &events) {
+
+  if (!isTrackedInstrumentId(header.instrumentId)) {
+    LOG_TRACE("Skipping update message for untracked instrument: ",
+              header.instrumentId);
     return;
   }
 
-  // Calculate VWAP after each event
-  calculateVWAP(orderbook);
+  auto ob_it =
+      orderbooks.find(header.instrumentId); // Use different iterator name
+  bool bookExists = (ob_it != orderbooks.end());
+  bool bookIsValid = bookExists && ob_it->second.isValid;
+  int64_t currentChangeNo = bookExists ? ob_it->second.changeNo : -1;
+  int64_t expectedChangeNo = bookExists ? currentChangeNo + 1 : -1;
+
+  // --- Caching Logic ---
+  bool needsCaching = !bookExists || !bookIsValid ||
+                      (bookIsValid && header.changeNo != expectedChangeNo);
+
+  if (bookIsValid && header.changeNo <= currentChangeNo) {
+    LOG_WARN("Received old update message for ID: ", header.instrumentId,
+             " Received ChangeNo: ", header.changeNo,
+             " Book ChangeNo: ", currentChangeNo, ". Discarding.");
+    return; // Discard old messages
+  }
+
+  if (needsCaching) {
+    LOG_INFO("Caching update message for ID: ", header.instrumentId,
+             " ChangeNo: ", header.changeNo, " Reason: bookExists=", bookExists,
+             " bookIsValid=", bookIsValid,
+             " expectedChangeNo=", expectedChangeNo);
+
+    if (bookIsValid && header.changeNo != expectedChangeNo) {
+      LOG_WARN("Out-of-sequence update for ID: ", header.instrumentId,
+               " Received=", header.changeNo, " Expected=", expectedChangeNo,
+               ". Invalidating book.");
+      ob_it->second.isValid = false; // Invalidate book
+    }
+    cachedParsedUpdates[header.instrumentId].push_back(
+        {header.changeNo, events});
+    return;
+  }
+
+  // --- Direct Processing Logic ---
+  Orderbook &orderbook = ob_it->second;
+  LOG_TRACE("Processing update message directly for ID: ", header.instrumentId,
+            " ChangeNo: ", header.changeNo);
+
+  // Store previous VWAP state before applying events
+  orderbook.lastVwapNumerator = orderbook.vwapNumerator;
+  orderbook.lastVwapDenominator = orderbook.vwapDenominator;
+  orderbook.vwapChanged = false;
+
+  for (const auto &event : events) {
+    if (orderbook.tickSize <= 0) {
+      LOG_WARN("Invalid tick size for ID ", header.instrumentId,
+               ". Skipping event.");
+      continue;
+    }
+    double price =
+        orderbook.referencePrice + (event.priceOffset * orderbook.tickSize);
+    int priceLevelIndex = event.priceLevel - 1; // Convert 1-based to 0-based
+
+    if (priceLevelIndex < 0) {
+      LOG_ERROR("Invalid price level index (0 or negative): ",
+                event.priceLevel);
+      continue;
+    }
+
+    try {
+      switch (event.eventType) {
+      case EventType::ADD:
+        addPriceLevel(orderbook, event.side, priceLevelIndex, price,
+                      event.volume);
+        break;
+      case EventType::MODIFY:
+        modifyPriceLevel(orderbook, event.side, priceLevelIndex, price,
+                         event.volume);
+        break;
+      case EventType::DELETE:
+        deletePriceLevel(orderbook, event.side, priceLevelIndex);
+        break;
+      default:
+        LOG_ERROR("Unknown event type in handleUpdateMessage: ",
+                  static_cast<char>(event.eventType));
+        break;
+      }
+    } catch (const std::out_of_range &e) {
+      LOG_ERROR("Error processing price level index: ", priceLevelIndex + 1,
+                " for ID ", header.instrumentId);
+    }
+  }
+
+  orderbook.changeNo = header.changeNo;
+  calculateVWAP(orderbook); // Calculate VWAP once after all events are applied
 }
+
+// --- Internal Orderbook Manipulation ---
 
 // Add a price level
 void OrderbookManager::addPriceLevel(Orderbook &orderbook, Side side,
@@ -325,35 +434,31 @@ void OrderbookManager::addPriceLevel(Orderbook &orderbook, Side side,
   auto &levels = (side == Side::BID) ? orderbook.bids : orderbook.asks;
   int &count = (side == Side::BID) ? orderbook.bidCount : orderbook.askCount;
 
-  if (priceLevelIndex > count || priceLevelIndex >= MAX_PRICE_LEVELS) {
+  if (priceLevelIndex < 0 || priceLevelIndex > count ||
+      priceLevelIndex >= MAX_PRICE_LEVELS) {
     LOG_WARN("Add level index out of bounds: Index=", priceLevelIndex,
-             " Count=", count, " Max=", MAX_PRICE_LEVELS);
-    // Optionally clamp or handle error based on spec interpretation
-    return; // Skip invalid add
-  }
-
-  // Shift elements if inserting within existing levels or at the end but below
-  // max
-  if (priceLevelIndex < count && count < MAX_PRICE_LEVELS) {
-    for (int i = count; i > priceLevelIndex; --i) {
-      levels[i] = levels[i - 1];
-    }
-  } else if (priceLevelIndex < MAX_PRICE_LEVELS) {
-    // Inserting at the end, just make sure count doesn't exceed max
-  } else {
-    // Should have been caught by the bounds check above
+             " CurrentCount=", count, " MaxLevels=", MAX_PRICE_LEVELS);
     return;
   }
 
-  levels[priceLevelIndex].price = price;
-  levels[priceLevelIndex].volume = volume;
-
-  // Increment count only if we are adding within the max limit
-  if (count < MAX_PRICE_LEVELS) {
+  if (priceLevelIndex <
+      count) { // Inserting within existing or replacing last element if full
+    if (count == MAX_PRICE_LEVELS) { // Shift and overwrite last if full
+      for (int i = count - 1; i > priceLevelIndex; --i) {
+        levels[i] = levels[i - 1];
+      }
+    } else { // Shift and increment count if not full
+      for (int i = count; i > priceLevelIndex; --i) {
+        levels[i] = levels[i - 1];
+      }
+      count++;
+    }
+  } else if (priceLevelIndex == count &&
+             count < MAX_PRICE_LEVELS) { // Appending
     count++;
   }
-  // If inserting at an index that was already the max, we effectively replace
-  // No else needed here as the replacement happens above.
+  // Insert/Update the level data
+  levels[priceLevelIndex] = {price, volume};
 }
 
 // Modify a price level
@@ -372,8 +477,7 @@ void OrderbookManager::modifyPriceLevel(Orderbook &orderbook, Side side,
              " Count=", count);
     return;
   }
-  levels.at(priceLevelIndex).price = price; // Use .at() for bounds check
-  levels.at(priceLevelIndex).volume = volume;
+  levels[priceLevelIndex] = {price, volume};
 }
 
 // Delete a price level
@@ -392,108 +496,79 @@ void OrderbookManager::deletePriceLevel(Orderbook &orderbook, Side side,
     return;
   }
 
-  // Shift elements left to fill the gap
   for (int i = priceLevelIndex; i < count - 1; ++i) {
     levels[i] = levels[i + 1];
   }
 
-  // Decrement count and clear the last (now unused) element
   if (count > 0) {
-    levels[count - 1].price = 0.0; // Optional: Clear old data
-    levels[count - 1].volume = 0;
     count--;
+    levels[count] = {0.0, 0}; // Clear the element at the new end
   }
 }
 
 // Calculate VWAP for an orderbook
 void OrderbookManager::calculateVWAP(Orderbook &orderbook) {
-  LOG_TRACE("Calculating VWAP for ID: ", orderbook.instrumentId);
-  uint64_t numeratorSum = 0;
-  uint64_t denominatorSum = 0;
-
-  auto nameIt = idToName.find(orderbook.instrumentId);
-  std::string instrName =
-      (nameIt != idToName.end()) ? nameIt->second : "unknown";
-
-  // Ensure tickSize is positive to avoid division by zero or unexpected
-  // behavior
+  if (!orderbook.isValid) {
+    LOG_TRACE("Skipping VWAP calculation for invalid orderbook ID: ",
+              orderbook.instrumentId);
+    orderbook.vwapChanged = false;
+    return;
+  }
   if (orderbook.tickSize <= 0) {
     LOG_WARN("Invalid tick size (", orderbook.tickSize, ") for ID ",
              orderbook.instrumentId, ". VWAP calculation skipped.");
-    // Keep VWAP unchanged or set to zero? Let's keep it unchanged for now.
     orderbook.vwapChanged =
         (orderbook.vwapNumerator != orderbook.lastVwapNumerator ||
          orderbook.vwapDenominator != orderbook.lastVwapDenominator);
     return;
   }
 
-  // Process bids
-  LOG_TRACE("  Bids (Count=", orderbook.bidCount, ")");
+  LOG_TRACE("Calculating VWAP for ID: ", orderbook.instrumentId);
+  uint64_t numeratorSum = 0;
+  uint64_t denominatorSum = 0;
+
+  // Bids
   for (int i = 0; i < orderbook.bidCount; ++i) {
     const auto &level = orderbook.bids[i];
     if (level.volume > 0 && level.price > 0) {
-      // Normalize price by tickSize before calculation, cast to integer
       uint32_t normalizedPrice = static_cast<uint32_t>(
-          level.price / orderbook.tickSize + 0.5); // Add 0.5 for rounding
+          level.price / orderbook.tickSize + 0.5); // Rounding
       numeratorSum += static_cast<uint64_t>(normalizedPrice) * level.volume;
       denominatorSum += level.volume;
-      LOG_TRACE("    Level ", i, ": Price=", level.price,
-                " (Norm=", normalizedPrice, ")", " Vol=", level.volume,
-                " | Running Sums: N=", numeratorSum, " D=", denominatorSum);
     }
   }
 
-  // Process asks
-  LOG_TRACE("  Asks (Count=", orderbook.askCount, ")");
+  // Asks
   for (int i = 0; i < orderbook.askCount; ++i) {
     const auto &level = orderbook.asks[i];
     if (level.volume > 0 && level.price > 0) {
-      // Normalize price by tickSize before calculation, cast to integer
       uint32_t normalizedPrice = static_cast<uint32_t>(
-          level.price / orderbook.tickSize + 0.5); // Add 0.5 for rounding
+          level.price / orderbook.tickSize + 0.5); // Rounding
       numeratorSum += static_cast<uint64_t>(normalizedPrice) * level.volume;
       denominatorSum += level.volume;
-      LOG_TRACE("    Level ", i, ": Price=", level.price,
-                " (Norm=", normalizedPrice, ")", " Vol=", level.volume,
-                " | Running Sums: N=", numeratorSum, " D=", denominatorSum);
     }
   }
 
-  // Update VWAP components
   uint32_t finalNumerator = static_cast<uint32_t>(numeratorSum);
   uint32_t finalDenominator = static_cast<uint32_t>(denominatorSum);
 
-  // Check if VWAP has changed *before* updating the values
-  if (finalNumerator != orderbook.vwapNumerator ||
-      finalDenominator != orderbook.vwapDenominator) {
+  if (finalNumerator != orderbook.lastVwapNumerator ||
+      finalDenominator != orderbook.lastVwapDenominator) {
     LOG_DEBUG("VWAP changed for ID: ", orderbook.instrumentId,
               " New: ", finalNumerator, "/", finalDenominator,
-              " Old: ", orderbook.vwapNumerator, "/",
-              orderbook.vwapDenominator);
+              " Old: ", orderbook.lastVwapNumerator, "/",
+              orderbook.lastVwapDenominator);
     orderbook.vwapChanged = true;
   } else {
-    orderbook.vwapChanged = false; // Explicitly set to false if no change
+    orderbook.vwapChanged = false;
   }
 
-  // Store the new VWAP values
   orderbook.vwapNumerator = finalNumerator;
   orderbook.vwapDenominator = finalDenominator;
 
   LOG_TRACE("  Final VWAP: N=", orderbook.vwapNumerator,
             " D=", orderbook.vwapDenominator,
             " Changed=", (orderbook.vwapChanged ? "yes" : "no"));
-}
-
-// TODO: FinalizeUpdate might need adjustment based on when VWAP is calculated
-void OrderbookManager::finalizeUpdate() {
-  // If VWAP is calculated after each event, this might just be a placeholder.
-  // If VWAP is calculated once per update message (after all events),
-  // the calculation would happen here or just before getChangedVWAPs.
-  // For now, assuming calculateVWAP is called after each event or after
-  // processing all events for an instrument in the message.
-  LOG_TRACE("Finalizing update for instrument ID: ", currentInstrumentId);
-  // Resetting the context is important if processing moves to another
-  // instrument currentInstrumentId = -1; // Or handle context differently
 }
 
 // Get changed VWAPs
@@ -503,7 +578,6 @@ OrderbookManager::getChangedVWAPs() const {
   std::vector<VWAPResult> results;
   for (const auto &pair : orderbooks) {
     const auto &orderbook = pair.second;
-    // Check validity and non-empty conditions as per README
     if (orderbook.vwapChanged && orderbook.isValid && orderbook.askCount > 0 &&
         orderbook.bidCount > 0) {
       LOG_DEBUG("Reporting changed VWAP for ID: ", orderbook.instrumentId,
@@ -512,7 +586,6 @@ OrderbookManager::getChangedVWAPs() const {
       results.push_back({orderbook.instrumentId, orderbook.vwapNumerator,
                          orderbook.vwapDenominator});
     } else if (orderbook.vwapChanged) {
-      // Log why a changed VWAP wasn't reported
       LOG_TRACE("VWAP changed for ID ", orderbook.instrumentId,
                 " but not reported (isValid=", orderbook.isValid,
                 ", askCount=", orderbook.askCount,

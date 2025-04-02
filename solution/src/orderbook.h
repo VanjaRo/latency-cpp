@@ -3,6 +3,7 @@
 #include "protocol_parser.h"
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -45,9 +46,26 @@ struct Orderbook {
   Orderbook();
 };
 
-// Structure to hold cached updates when sync is needed
-struct CachedUpdate {
-  std::vector<uint8_t> data;
+// Structure to hold parsed update events for caching
+struct CachedParsedUpdateEvent {
+  EventType eventType;
+  Side side;
+  int priceLevel;      // 1-based from protocol
+  int64_t priceOffset; // vint from protocol
+  int64_t volume;      // vint from protocol
+};
+
+// Structure to hold a complete cached update message (header info + events)
+struct CachedParsedUpdate {
+  int64_t changeNo;
+  std::vector<CachedParsedUpdateEvent> events;
+  // No need for instrumentId, refPrice, tickSize here; retrieved from Orderbook
+  // when applying.
+
+  // Add a comparison operator for sorting
+  bool operator<(const CachedParsedUpdate &other) const {
+    return changeNo < other.changeNo;
+  }
 };
 
 class OrderbookManager {
@@ -65,16 +83,16 @@ public:
   bool isRelevantIP(uint32_t ip) const;
 
   // Process snapshot
-  void processSnapshot(const InstrumentInfo &info);
+  void processSnapshotInfo(const InstrumentInfo &info);
   void processSnapshotOrderbook(int32_t instrumentId, Side side, double price,
                                 int32_t volume);
 
-  // Process update
-  void processUpdateHeader(const UpdateHeader &header);
-  void processUpdateEvent(const UpdateEvent &event);
-
   // Finalize the current update and calculate VWAP
-  void finalizeUpdate();
+  void finalizeSnapshot(int32_t instrumentId);
+
+  // Process update
+  void handleUpdateMessage(const UpdateHeader &header,
+                           const std::vector<CachedParsedUpdateEvent> &events);
 
   // Get changed VWAPs for output
   struct VWAPResult {
@@ -89,10 +107,10 @@ private:
   std::unordered_map<int32_t, Orderbook> orderbooks;
   std::unordered_set<std::string> trackedInstruments;
   std::unordered_map<int32_t, std::string> idToName;
-  std::unordered_map<int32_t, std::vector<CachedUpdate>> cachedUpdates;
 
-  // Currently processing instrument ID
-  int32_t currentInstrumentId;
+  // Cache for out-of-sequence or pre-snapshot updates
+  std::unordered_map<int32_t, std::vector<CachedParsedUpdate>>
+      cachedParsedUpdates;
 
   // Filtered IPs
   uint32_t snapshotIP;
@@ -107,4 +125,7 @@ private:
   void modifyPriceLevel(Orderbook &orderbook, Side side, int priceLevelIndex,
                         double price, int64_t volume);
   void deletePriceLevel(Orderbook &orderbook, Side side, int priceLevelIndex);
+
+  // Applies cached updates after a snapshot
+  void applyCachedUpdates(Orderbook &orderbook);
 };

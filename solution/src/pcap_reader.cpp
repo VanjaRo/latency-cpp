@@ -304,8 +304,7 @@ static int processFrameCallback(const light_packet_header *frame_header,
   // If filtering by IP, check if this frame matches our target IPs
   if (filterByIP) {
     std::cout << "Checking IPs: src=0x" << std::hex << srcIP << ", dst=0x"
-              << dstIP << ", target1=0x" << snapshotIP << ", target2=0x"
-              << updateIP << std::dec << std::endl;
+              << dstIP << std::dec << std::endl;
 
     // Check both source and destination IPs against both target IPs
     bool matchFound = (srcIP == snapshotIP || srcIP == updateIP ||

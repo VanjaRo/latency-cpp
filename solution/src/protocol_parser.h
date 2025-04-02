@@ -1,6 +1,9 @@
 #pragma once
 
 #include "protocol_logger.h"
+// Forward declare OrderbookManager to avoid circular dependency
+class OrderbookManager;
+
 #include <cstdint>
 #include <functional>
 #include <stdexcept> // For runtime_error in decodeVInt
@@ -24,6 +27,14 @@ enum class SnapshotFieldId : uint16_t {
 enum class UpdateFieldId : uint16_t {
   UPDATE_HEADER = 0x0003,
   UPDATE_ENTRY = 0x1001,
+  // Summary fields (to be skipped)
+  SUMMARY_1002 = 0x1002,
+  SUMMARY_1011 = 0x1011,
+  SUMMARY_1012 = 0x1012,
+  SUMMARY_1013 = 0x1013,
+  SUMMARY_1014 = 0x1014,
+  SUMMARY_1015 = 0x1015,
+  SUMMARY_1016 = 0x1016,
 };
 
 // Event types in updates
@@ -65,27 +76,17 @@ static_assert(sizeof(InstrumentInfoFieldLayout) == 112,
 //     int32_t change_no;
 // };
 
-// Structure representing an entry within the Orderbook field (0x0103)
-// struct OrderbookEntryLayout { // <-- Original thought based on README?
-//   int32_t instrument_id;
-//   char direction;
-//   double price;
-//   int32_t volume;
-// The impl loop has `fieldOffset + 9 <= fieldHeader->fieldLen` and reads
-// Side(1), price(8), volume(4). That's 13. Ah, the `instrument_id` is
-// *outside* the loop in the impl, read once.
-// };
-
-// Let's adjust the OrderbookEntryLayout based on implementation: Side, Price,
-// Volume
-struct OrderbookLevelLayout { // <-- Current struct based on implementation
-  char side;                  // '0' or '1'
+// Structure representing an entry within the Snapshot Orderbook field (0x0103)
+// based on README.md
+struct SnapshotOrderbookEntryLayout {
+  int32_t instrument_id;
+  char direction; // '0' or '1'
   double price;
   int32_t volume;
-  // Size = 1 + 8 + 4 = 13 bytes
+  // Size = 4 + 1 + 8 + 4 = 17 bytes
 };
-static_assert(sizeof(OrderbookLevelLayout) == 13,
-              "OrderbookLevelLayout size mismatch");
+static_assert(sizeof(SnapshotOrderbookEntryLayout) == 17,
+              "SnapshotOrderbookEntryLayout size mismatch");
 
 #pragma pack(pop)
 
@@ -115,31 +116,23 @@ struct UpdateHeader {
   int64_t changeNo;
 };
 
-// Callbacks for different message types
-using SnapshotInstrumentCallback = std::function<void(const InstrumentInfo &)>;
-using SnapshotOrderbookCallback = std::function<void(
-    int32_t /*instrId*/, Side, double /*price*/, int32_t /*volume*/)>;
-using UpdateHeaderCallback = std::function<void(const UpdateHeader &)>;
-using UpdateEventCallback = std::function<void(const UpdateEvent &)>;
-
 class ProtocolParser {
 public:
-  // Constructor no longer takes a log level
-  explicit ProtocolParser() = default; // Use default constructor
+  // Constructor no longer takes or uses runtime log level
+  explicit ProtocolParser(OrderbookManager &manager) : manager_(manager) {
+    LOG_INFO("ProtocolParser created, linked with OrderbookManager.");
+  }
 
-  // Parse a frame and call appropriate callbacks
-  void parsePayload(const uint8_t *data, size_t size,
-                    const SnapshotInstrumentCallback &instrCallback,
-                    const SnapshotOrderbookCallback &orderbookCallback,
-                    const UpdateHeaderCallback &updateHeaderCallback,
-                    const UpdateEventCallback &updateEventCallback);
+  // Parse a frame and call manager methods directly
+  void parsePayload(const uint8_t *data, size_t size); // Removed callbacks
 
   // Helper to decode vint (variable length integer)
-  // Made static as it doesn't depend on parser state
   static int64_t decodeVInt(const uint8_t *data, size_t &offset,
-                            size_t available_bytes); // Added available_bytes
+                            size_t available_bytes);
 
 private:
+  OrderbookManager &manager_; // Reference to the manager
+
   // Structure to track field parsing state
   struct FieldContext {
     const uint8_t *data;      // Base pointer to message data
@@ -168,7 +161,7 @@ private:
 
   // Template declarations
   template <typename T>
-  static T *getFieldPtr(const uint8_t *data, size_t offset, size_t size);
+  static const T *getFieldPtr(const uint8_t *data, size_t offset, size_t size);
 
   template <typename FieldIdType>
   bool processFields(
@@ -176,27 +169,22 @@ private:
       const std::function<bool(FieldIdType, const uint8_t *, size_t)> &handler);
 
   // Non-template method declarations
-  void parseSnapshotMessage(const uint8_t *data, size_t size,
-                            const SnapshotInstrumentCallback &instrCallback,
-                            const SnapshotOrderbookCallback &orderbookCallback);
+  void parseSnapshotMessage(const uint8_t *data,
+                            size_t size); // Removed callbacks
+  void parseUpdateMessage(const uint8_t *data,
+                          size_t size); // Removed callbacks
 
-  void parseUpdateMessage(const uint8_t *data, size_t size,
-                          const UpdateHeaderCallback &updateHeaderCallback,
-                          const UpdateEventCallback &updateEventCallback);
-
+  // These helpers now need access to manager_, so make them non-static members
   bool parseOrderbookField(const uint8_t *data, size_t size,
-                           int32_t expectedInstrId,
-                           const SnapshotOrderbookCallback &callback);
-
+                           int32_t expectedInstrId); // Removed callback
   bool parseUpdateEntryField(const uint8_t *data, size_t size,
-                             int64_t instrumentId,
-                             const UpdateEventCallback &callback);
+                             int64_t instrumentId); // Removed callback
 };
 
 // Template implementations
 template <typename T>
-T *ProtocolParser::getFieldPtr(const uint8_t *data, size_t offset,
-                               size_t size) {
+const T *ProtocolParser::getFieldPtr(const uint8_t *data, size_t offset,
+                                     size_t size) {
   if (offset + sizeof(T) > size) {
     throw std::runtime_error("Field access beyond buffer");
   }
@@ -230,3 +218,6 @@ bool ProtocolParser::processFields(
   }
   return true;
 }
+
+// Include OrderbookManager definitions *after* ProtocolParser declaration
+#include "orderbook.h"

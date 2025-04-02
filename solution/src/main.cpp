@@ -24,8 +24,8 @@ void processPackets(SharedQueue &inputQueue, SharedQueue &outputQueue,
   OrderbookManager orderbookManager;
   orderbookManager.loadMetadata(metadataPath);
 
-  // Create protocol parser
-  ProtocolParser parser;
+  // Create protocol parser, passing the manager
+  ProtocolParser parser(orderbookManager);
 
   // Process frames from the queue
   while (true) {
@@ -46,34 +46,19 @@ void processPackets(SharedQueue &inputQueue, SharedQueue &outputQueue,
       continue;
     }
 
-    // Process the frame with callbacks
+    // Process the frame using the parser, which calls the appropriate
+    // OrderbookManager methods internally
     bool isSnapshot =
         (header->typeId == static_cast<uint8_t>(MessageType::SNAPSHOT));
-    bool vwapChanged = false;
-
     parser.parsePayload(
-        readPtr, frameSize,
-        // SnapshotInstrumentCallback
-        [&](const InstrumentInfo &info) {
-          orderbookManager.processSnapshot(info);
-        },
-        // SnapshotOrderbookCallback
-        [&](int64_t instrumentId, Side side, double price, int64_t volume) {
-          orderbookManager.processSnapshotOrderbook(instrumentId, side, price,
-                                                    volume);
-        },
-        // UpdateHeaderCallback
-        [&](const UpdateHeader &header) {
-          orderbookManager.processUpdateHeader(header);
-        },
-        // UpdateEventCallback
-        [&](const UpdateEvent &event) {
-          orderbookManager.processUpdateEvent(event);
-        });
+        readPtr, frameSize); // Parser now handles calling finalizeSnapshot or
+                             // handleUpdateMessage internally
 
-    // Finalize update and prepare output
+    // Prepare output AFTER the parser has processed the payload
     if (!isSnapshot) {
-      orderbookManager.finalizeUpdate();
+      // No need to call finalizeUpdate() here anymore.
+      // getChangedVWAPs checks the result of the processing done by
+      // handleUpdateMessage called within parsePayload.
       auto changedVWAPs = orderbookManager.getChangedVWAPs();
 
       if (changedVWAPs.empty()) {
@@ -103,19 +88,26 @@ void processPackets(SharedQueue &inputQueue, SharedQueue &outputQueue,
           writePtr += sizeof(uint32_t);
         }
 
-        outputQueue.advanceProducer(sizeof(uint32_t) +
-                                    changedVWAPs.size() * 3 * sizeof(uint32_t));
+        // Calculate total size to advance producer
+        size_t totalBytes =
+            sizeof(uint32_t) + changedVWAPs.size() * 3 * sizeof(uint32_t);
+        // Align totalBytes to 8-byte boundary if needed by shared queue
+        // protocol
+        totalBytes = (totalBytes + 7) & ~7;
+        outputQueue.advanceProducer(totalBytes);
       }
     } else {
-      // For snapshots, just write 0
+      // For snapshots, just write 0 (as per README)
       uint32_t *writePtr =
           reinterpret_cast<uint32_t *>(outputQueue.getWritePtr());
       *writePtr = 0;
-      outputQueue.advanceProducer(sizeof(uint32_t));
+      // Align to 8-byte boundary if needed
+      outputQueue.advanceProducer((sizeof(uint32_t) + 7) & ~7);
     }
 
-    // Advance the consumer pointer in the input queue
-    inputQueue.advanceConsumer(frameSize);
+    // Advance the consumer pointer in the input queue (aligned)
+    size_t alignedFrameSize = (frameSize + 7) & ~7;
+    inputQueue.advanceConsumer(alignedFrameSize);
   }
 }
 
@@ -127,7 +119,8 @@ int debugPcapReading(const std::string &pcapFilename,
     OrderbookManager orderbookManager;
     orderbookManager.loadMetadata(metadataPath);
 
-    ProtocolParser parser;
+    // Create parser linked to the manager
+    ProtocolParser parser(orderbookManager);
     PcapReader pcapReader(pcapFilename);
 
     uint32_t snapshotIP = 0, updateIP = 0;
@@ -156,30 +149,12 @@ int debugPcapReading(const std::string &pcapFilename,
         [&](const uint8_t *data, size_t size, uint32_t srcIP, uint32_t dstIP) {
           bool isSnapshot = (srcIP == snapshotIP);
 
-          parser.parsePayload(
-              data, size,
-              // SnapshotInstrumentCallback
-              [&](const InstrumentInfo &info) {
-                orderbookManager.processSnapshot(info);
-              },
-              // SnapshotOrderbookCallback
-              [&](int64_t instrumentId, Side side, double price,
-                  int64_t volume) {
-                orderbookManager.processSnapshotOrderbook(instrumentId, side,
-                                                          price, volume);
-              },
-              // UpdateHeaderCallback
-              [&](const UpdateHeader &header) {
-                orderbookManager.processUpdateHeader(header);
-              },
-              // UpdateEventCallback
-              [&](const UpdateEvent &event) {
-                orderbookManager.processUpdateEvent(event);
-              });
+          // Parse the payload - parser calls appropriate OB methods
+          parser.parsePayload(data, size);
 
-          // Finalize update if it's an incremental update
+          // Check for changed VWAPs AFTER parsing an UPDATE payload
           if (!isSnapshot) {
-            orderbookManager.finalizeUpdate();
+            // No need to call finalizeUpdate() here anymore.
             auto changedVWAPs = orderbookManager.getChangedVWAPs();
 
             // Print changed VWAPs for debugging
@@ -192,6 +167,7 @@ int debugPcapReading(const std::string &pcapFilename,
               }
             }
           }
+          // No output needed for snapshot frames in debug mode either
         });
 
     return 0;
@@ -203,18 +179,15 @@ int debugPcapReading(const std::string &pcapFilename,
 #endif
 
 int main(int argc, char *argv[]) {
-  // Log the compile-time log level
   LOG_INFO("Application started with compile-time log level: ",
            COMPILE_TIME_LOG_LEVEL_STR);
 
-  // --- Argument Parsing (Simplified) ---
-  std::vector<std::string> args(argv + 1, argv + argc); // Exclude program name
+  std::vector<std::string> args(argv + 1, argv + argc);
 
-  // --- Mode Selection based on remaining args ---
 #if DEBUG_PCAP_READING
-  // If args match debug mode (2 args: pcap, metadata)
   if (args.size() == 2) {
-    LOG_INFO("Running in DEBUG_PCAP_READING mode.");
+    LOG_INFO("Running in DEBUG_PCAP_READING mode (Compile-time log level: ",
+             COMPILE_TIME_LOG_LEVEL_STR, ")");
     return debugPcapReading(args[0], args[1]);
   }
 #endif
@@ -247,7 +220,7 @@ int main(int argc, char *argv[]) {
     SharedQueue outputQueue(outputHeaderPath, outputBufferPath, bufferSize,
                             true);
 
-    // Process packets
+    // Process packets using the updated function
     processPackets(inputQueue, outputQueue, metadataPath);
 
     return 0;
