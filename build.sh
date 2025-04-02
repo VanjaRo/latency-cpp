@@ -1,13 +1,25 @@
 #!/bin/bash
-# Main build script for latency challenge
-# Usage: ./build.sh [--with-lightpcapng] [--docker] [--run]
+# Local build script for the latency solution
+# Usage: ./build.sh [--with-lightpcapng | --no-lightpcapng] [--log-level <LEVEL>]
 
 set -euo pipefail
 
-# Parse command line arguments
+# Default values
 USE_LIGHTPCAPNG=ON
-BUILD_DOCKER=false
-RUN_DOCKER=false
+LOG_LEVEL="NONE" # Default log level
+
+# --- Argument Parsing ---
+VALID_LOG_LEVELS=("NONE" "ERROR" "WARN" "INFO" "DEBUG" "TRACE")
+
+function is_valid_log_level() {
+  local level="$1"
+  for valid_level in "${VALID_LOG_LEVELS[@]}"; do
+    if [[ "$level" == "$valid_level" ]]; then
+      return 0 # Valid
+    fi
+  done
+  return 1 # Invalid
+}
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -15,62 +27,65 @@ while [[ $# -gt 0 ]]; do
       USE_LIGHTPCAPNG=ON
       shift
       ;;
-    --docker)
-      BUILD_DOCKER=true
+    --no-lightpcapng)
+      USE_LIGHTPCAPNG=OFF
       shift
       ;;
-    --run)
-      RUN_DOCKER=true
-      shift
+    --log-level)
+      if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
+          if is_valid_log_level "$2"; then
+              LOG_LEVEL="$2"
+              shift 2
+          else
+              echo "Error: Invalid log level '$2'. Must be one of: ${VALID_LOG_LEVELS[*]}"
+              exit 1
+          fi
+      else
+        echo "Error: --log-level requires an argument."
+        echo "Usage: $0 [--with-lightpcapng | --no-lightpcapng] [--log-level <LEVEL>]"
+        exit 1
+      fi
       ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: $0 [--with-lightpcapng] [--docker] [--run]"
+      echo "Usage: $0 [--with-lightpcapng | --no-lightpcapng] [--log-level <LEVEL>]"
       exit 1
       ;;
   esac
 done
 
-# Build Docker image if requested
-if [ "$BUILD_DOCKER" = true ]; then
-  echo "=== Building Docker image ==="
-  docker build --platform linux/amd64 -t latency-solution solution/
-  echo "Docker image built successfully."
-  exit 0
-fi
-
-# Run Docker with volume mount if requested
-if [ "$RUN_DOCKER" = true ]; then
-  echo "=== Running Docker container with volume mount ==="
-  docker run -it --rm \
-    --platform linux/amd64 \
-    -v "$(pwd):/app" \
-    -v "$(pwd)/lat-spring-data:/app/data" \
-    -v "$(pwd)/results:/app/results" \
-    latency-solution
-  exit 0
-fi
-
-# Otherwise build locally
+# --- Local Build ---
 echo "=== Building solution locally ==="
-mkdir -p solution/build
-cd solution/build
+SOLUTION_DIR="$(pwd)/solution"
+BUILD_DIR="${SOLUTION_DIR}/build"
+BIN_DIR="${BUILD_DIR}/bin"
 
-echo "=== Running CMake ==="
-cmake .. -DUSE_LIGHTPCAPNG=${USE_LIGHTPCAPNG}
+mkdir -p "${BUILD_DIR}"
+cd "${BUILD_DIR}"
 
-echo "=== Building with Make ==="
-make -j$(nproc)
+echo "--- Running CMake ---"
+# Pass the absolute path to the source directory to CMake
+cmake "${SOLUTION_DIR}" \
+    -DUSE_LIGHTPCAPNG=${USE_LIGHTPCAPNG} \
+    -DCMAKE_LOG_LEVEL=${LOG_LEVEL}
 
-# Copy binaries to the solution directory for easier access
-cp solution ../
-cp pcap_dumper ../
+echo "--- Building with Make ---"
+# Use nproc if available, otherwise default to 1 core
+NPROC=$(nproc 2>/dev/null || echo 1)
+make -j${NPROC}
 
-echo "=== Build completed successfully! ==="
+# Binaries are placed in ${BIN_DIR} by CMake install rule
+echo "--- Binaries located in ${BIN_DIR} ---"
+
+cd ../.. # Return to the root directory
+
+echo "=== Local build completed successfully! ==="
 if [ "${USE_LIGHTPCAPNG}" = "ON" ]; then
   echo "Built with LightPcapNg library support."
 else
   echo "Built with custom PCAP parsing (no LightPcapNg)."
 fi
 
-cd ../..
+echo "Built with compile-time log level: ${LOG_LEVEL}"
+
+echo "Script finished."

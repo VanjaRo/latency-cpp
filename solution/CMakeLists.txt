@@ -8,6 +8,31 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Options
 option(USE_LIGHTPCAPNG "Use LightPcapNg library instead of custom implementation" OFF)
 
+# Log Level Option
+set(LOG_LEVEL_OPTIONS NONE ERROR WARN INFO DEBUG TRACE)
+set(CMAKE_LOG_LEVEL "INFO" CACHE STRING "Compile-time log level (NONE, ERROR, WARN, INFO, DEBUG, TRACE)")
+set_property(CACHE CMAKE_LOG_LEVEL PROPERTY STRINGS ${LOG_LEVEL_OPTIONS})
+
+# Validate the chosen level
+if(NOT CMAKE_LOG_LEVEL IN_LIST LOG_LEVEL_OPTIONS)
+    message(FATAL_ERROR "Invalid CMAKE_LOG_LEVEL specified: ${CMAKE_LOG_LEVEL}. Must be one of ${LOG_LEVEL_OPTIONS}")
+endif()
+
+# Map Log Level string to integer value for preprocessor
+if(CMAKE_LOG_LEVEL STREQUAL "NONE")
+    set(LOG_LEVEL_INT 0)
+elseif(CMAKE_LOG_LEVEL STREQUAL "ERROR")
+    set(LOG_LEVEL_INT 1)
+elseif(CMAKE_LOG_LEVEL STREQUAL "WARN")
+    set(LOG_LEVEL_INT 2)
+elseif(CMAKE_LOG_LEVEL STREQUAL "INFO")
+    set(LOG_LEVEL_INT 3)
+elseif(CMAKE_LOG_LEVEL STREQUAL "DEBUG")
+    set(LOG_LEVEL_INT 4)
+elseif(CMAKE_LOG_LEVEL STREQUAL "TRACE")
+    set(LOG_LEVEL_INT 5)
+endif()
+
 # Build type
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
@@ -21,7 +46,7 @@ set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -fsanitize=address")
 # LightPcapNg as a static dependency
 if(USE_LIGHTPCAPNG)
     # Set paths for the static library
-    set(LIGHTPCAPNG_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/lightpcapng")
+    set(LIGHTPCAPNG_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/LightPcapNg")
 
     # Add LightPcapNg as a subdirectory to build it
     if(EXISTS "${LIGHTPCAPNG_SRC_DIR}/CMakeLists.txt")
@@ -39,7 +64,7 @@ if(USE_LIGHTPCAPNG)
         # Define preprocessor macro to use LightPcapNg
         add_compile_definitions(USE_LIGHTPCAPNG)
     else()
-        message(FATAL_ERROR "LightPcapNg source directory not found at ${LIGHTPCAPNG_SRC_DIR}. Please ensure the LightPcapNg library is in the lib/lightpcapng directory.")
+        message(FATAL_ERROR "LightPcapNg source directory not found at ${LIGHTPCAPNG_SRC_DIR}. Please ensure the LightPcapNg library is in the lib/LightPcapNg directory.")
     endif()
 endif()
 
@@ -52,12 +77,19 @@ add_executable(solution
     src/orderbook.cpp
 )
 
+# Add compile definition for log level to the main executable
+target_compile_definitions(solution PRIVATE COMPILE_TIME_LOG_LEVEL=${LOG_LEVEL_INT})
+
 # PCAP dumper tool for debugging
 add_executable(pcap_dumper
     src/pcap_dumper.cpp
     src/pcap_reader.cpp
     src/protocol_parser.cpp
+    src/orderbook.cpp
 )
+
+# Add compile definition for log level to the pcap_dumper tool as well
+target_compile_definitions(pcap_dumper PRIVATE COMPILE_TIME_LOG_LEVEL=${LOG_LEVEL_INT})
 
 target_include_directories(solution PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_include_directories(pcap_dumper PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -77,5 +109,6 @@ if(USE_LIGHTPCAPNG)
 endif()
 
 # Install rules
-install(TARGETS solution DESTINATION ${CMAKE_CURRENT_SOURCE_DIR})
-install(TARGETS pcap_dumper DESTINATION ${CMAKE_CURRENT_SOURCE_DIR})
+# Install binaries to a standard location within the build environment
+install(TARGETS solution DESTINATION bin)
+install(TARGETS pcap_dumper DESTINATION bin)
