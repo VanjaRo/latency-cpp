@@ -1,26 +1,54 @@
 #include "protocol_parser.h"
+#include "protocol_logger.h"
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 
 // Decode ZigZag encoded vint
-int64_t ProtocolParser::decodeVInt(const uint8_t *data, size_t &offset) {
-  int64_t result = 0;
+int64_t ProtocolParser::decodeVInt(const uint8_t *data, size_t &offset,
+                                   size_t available_bytes) {
+  uint64_t unsigned_result = 0; // Use unsigned for varint decoding
   int shift = 0;
+  size_t start_offset = offset;
+
   while (true) {
+    if (offset >= available_bytes) {
+      throw std::runtime_error(
+          "Variable-length integer read past end of buffer");
+    }
     uint8_t byte = data[offset++];
-    result |= static_cast<int64_t>(byte & 0x7F) << shift;
+    unsigned_result |= static_cast<uint64_t>(byte & 0x7F) << shift;
     // If the most significant bit is not set, this is the last byte.
     if (!(byte & 0x80)) {
       break;
     }
     shift += 7;
-    if (shift >= 64) {
+    // Check for overflow: 10 bytes * 7 bits/byte = 70 bits, max is 64.
+    // If shift reaches 63 (meaning we are processing the 10th byte),
+    // the last byte must not have the MSB set and must contribute <= 1 bit.
+    if (shift >= 64) { // Varint technically uses max 10 bytes for 64 bits
       throw std::runtime_error("Variable-length integer is too long");
     }
   }
+  // ZigZag decode: (unsigned_result >> 1) ^ -(unsigned_result & 1)
+  int64_t result = (unsigned_result >> 1) ^ (-(int64_t)(unsigned_result & 1));
   return result;
 }
+
+// Constants for header skips
+constexpr size_t SNAPSHOT_HEADER_SKIP = 4;
+constexpr size_t UPDATE_HEADER_SKIP = 20;
+
+// Constants for INSTRUMENT_INFO field layout
+constexpr size_t INSTRUMENT_NAME_LEN = 31;
+constexpr size_t INSTRUMENT_UNUSED_LEN = 61;
+constexpr size_t INSTRUMENT_TICK_SIZE_LEN = sizeof(double);
+constexpr size_t INSTRUMENT_REFERENCE_PRICE_LEN = sizeof(double);
+constexpr size_t INSTRUMENT_ID_LEN = sizeof(int32_t);
+constexpr size_t INSTRUMENT_INFO_TOTAL_LEN =
+    INSTRUMENT_NAME_LEN + INSTRUMENT_UNUSED_LEN + INSTRUMENT_TICK_SIZE_LEN +
+    INSTRUMENT_REFERENCE_PRICE_LEN + INSTRUMENT_ID_LEN; // Should be 112
 
 void ProtocolParser::parsePayload(
     const uint8_t *data, size_t size,
@@ -29,38 +57,52 @@ void ProtocolParser::parsePayload(
     const UpdateHeaderCallback &updateHeaderCallback,
     const UpdateEventCallback &updateEventCallback) {
 
-  // Basic validation
   if (size < sizeof(FrameHeader)) {
+    LOG_ERROR("Message too small for header: size=", size);
     return;
   }
 
-  // Parse frame header
-  const FrameHeader *frameHeader = reinterpret_cast<const FrameHeader *>(data);
-
-  // Check if we have a complete message
-  if (size < sizeof(FrameHeader) + frameHeader->length) {
+  const FrameHeader *header = getFieldPtr<FrameHeader>(data, 0, size);
+  if (size < sizeof(FrameHeader) + header->length) {
+    LOG_ERROR("Incomplete message: expected ",
+              sizeof(FrameHeader) + header->length, " bytes, got ", size);
     return;
   }
 
-  // Skip header and process the message based on type
   const uint8_t *messageData = data + sizeof(FrameHeader);
-  size_t messageSize = frameHeader->length;
+  size_t messageSize = header->length;
+  MessageType msgType = static_cast<MessageType>(header->typeId);
 
-  // Process based on message type
-  MessageType msgType = static_cast<MessageType>(frameHeader->typeId);
+  LOG_DEBUG("Processing message type=", std::hex,
+            static_cast<int>(header->typeId), " size=", std::dec, messageSize);
 
-  if (msgType == MessageType::SNAPSHOT) {
-    // Parse snapshot message
-    // add unuzed 4 bytes
-    messageData += 4;
+  switch (msgType) {
+  case MessageType::SNAPSHOT: {
+    if (messageSize < SNAPSHOT_HEADER_SKIP) {
+      LOG_ERROR("Snapshot message too short after header skip");
+      return;
+    }
+    messageData += SNAPSHOT_HEADER_SKIP;
+    messageSize -= SNAPSHOT_HEADER_SKIP;
     parseSnapshotMessage(messageData, messageSize, instrCallback,
                          orderbookCallback);
-  } else if (msgType == MessageType::UPDATE) {
-    // Parse update message
-    // add unuzed 20 bytes
-    messageData += 20;
+    break;
+  }
+  case MessageType::UPDATE: {
+    if (messageSize < UPDATE_HEADER_SKIP) {
+      LOG_ERROR("Update message too short after header skip");
+      return;
+    }
+    messageData += UPDATE_HEADER_SKIP;
+    messageSize -= UPDATE_HEADER_SKIP;
     parseUpdateMessage(messageData, messageSize, updateHeaderCallback,
                        updateEventCallback);
+    break;
+  }
+  default:
+    LOG_DEBUG("Ignoring unknown message type: ", std::hex,
+              static_cast<int>(header->typeId));
+    break;
   }
 }
 
@@ -71,158 +113,77 @@ void ProtocolParser::parseSnapshotMessage(
     const SnapshotInstrumentCallback &instrCallback,
     const SnapshotOrderbookCallback &orderbookCallback) {
 
-  size_t offset = 0;
-  InstrumentInfo instrumentInfo = {};
-  bool hasInstrument = false;
-  int32_t instrumentId = 0;
-  int32_t changeNo = 0;
+  FieldContext ctx(data, size);
+  InstrumentInfo currentInstrument = {};
+  bool haveInstrument = false;
+  bool haveTradingSession = false;
 
-  std::cout << "Parsing snapshot message of size " << size << std::endl;
-
-  // Process fields until we reach the end of the message
-  while (offset + sizeof(FieldHeader) <= size) {
-    const FieldHeader *fieldHeader =
-        reinterpret_cast<const FieldHeader *>(data + offset);
-    offset += sizeof(FieldHeader);
-
-    // Ensure we have enough data for the field
-    if (offset + fieldHeader->fieldLen > size) {
-      std::cout << "Not enough data for field ID " << fieldHeader->fieldId
-                << ", need " << fieldHeader->fieldLen << " bytes, have "
-                << (size - offset) << std::endl;
-      break;
-    }
-
-    // Process field based on ID
-    SnapshotFieldId fieldId =
-        static_cast<SnapshotFieldId>(fieldHeader->fieldId);
-    std::cout << "Processing field ID " << std::hex
-              << static_cast<int16_t>(fieldId) << std::dec << " with length "
-              << fieldHeader->fieldLen << std::endl;
-
+  auto fieldHandler = [&](SnapshotFieldId fieldId, const uint8_t *fieldData,
+                          size_t fieldSize) {
     switch (fieldId) {
     case SnapshotFieldId::INSTRUMENT_INFO: {
-      const uint8_t *fieldData = data + offset;
-      size_t fieldOffset = 0;
-
-      // Validate field length (should be 112 bytes)
-      if (fieldHeader->fieldLen < 112) {
-        // std::cout << "Warning: INSTRUMENT_INFO field too short, expected 112
-        // "
-        //              "bytes but got "
-        //           << fieldHeader->fieldLen << std::endl;
-        break;
+      if (fieldSize < sizeof(InstrumentInfoFieldLayout)) {
+        LOG_ERROR("INSTRUMENT_INFO field too short: ", fieldSize);
+        return false;
       }
 
-      // Extract instrument name (31 bytes)
-      std::memcpy(instrumentInfo.name, fieldData + fieldOffset, 31);
-      //   instrumentInfo.name[30] = '\0'; // Ensure null termination
-      fieldOffset += 31;
+      const auto *layout =
+          reinterpret_cast<const InstrumentInfoFieldLayout *>(fieldData);
+      std::memcpy(currentInstrument.name, layout->instrument_name,
+                  sizeof(currentInstrument.name));
+      currentInstrument.tickSize = layout->tick_size;
+      currentInstrument.referencePrice = layout->reference_price;
+      currentInstrument.instrumentId = layout->instrument_id;
 
-      // Skip 61 bytes of unused data
-      fieldOffset += 61;
+      haveInstrument = true;
+      haveTradingSession = false;
 
-      // Extract tick_size (double, 8 bytes)
-      instrumentInfo.tickSize =
-          *reinterpret_cast<const double *>(fieldData + fieldOffset);
-      fieldOffset += sizeof(double);
-
-      // Extract reference_price (double, 8 bytes)
-      instrumentInfo.referencePrice =
-          *reinterpret_cast<const double *>(fieldData + fieldOffset);
-      fieldOffset += sizeof(double);
-
-      // Extract instrument_id (int32, 4 bytes)
-      instrumentInfo.instrumentId =
-          *reinterpret_cast<const int32_t *>(fieldData + fieldOffset);
-      fieldOffset += sizeof(int32_t);
-
-      instrumentId = instrumentInfo.instrumentId;
-      hasInstrument = true;
-
-      std::cout << "Found instrument info: name='" << instrumentInfo.name
-                << "', id=" << instrumentInfo.instrumentId
-                << ", tickSize=" << instrumentInfo.tickSize
-                << ", refPrice=" << instrumentInfo.referencePrice << std::endl;
-      break;
+      LOG_DEBUG("Parsed instrument info: name='", currentInstrument.name,
+                "' id=", currentInstrument.instrumentId);
+      return true;
     }
 
     case SnapshotFieldId::TRADING_SESSION_INFO: {
-      const uint8_t *fieldData = data + offset;
-
-      if (hasInstrument) {
-        // we are interested in the last 4 bytes of the 154 bytes field
-        const int32_t changeNo = *reinterpret_cast<const int32_t *>(
-            fieldData + fieldHeader->fieldLen - 4);
-        instrumentInfo.changeNo = changeNo;
-
-        // Call instrument callback
-        std::cout << "Calling instrument callback for '" << instrumentInfo.name
-                  << "' with changeNo " << changeNo << std::endl;
-        instrCallback(instrumentInfo);
+      if (!haveInstrument) {
+        LOG_WARN("Received trading session info without instrument info");
+        return false;
       }
-      break;
+
+      if (fieldSize < sizeof(int32_t)) {
+        LOG_ERROR("TRADING_SESSION_INFO field too short");
+        return false;
+      }
+
+      currentInstrument.changeNo = *reinterpret_cast<const int32_t *>(
+          fieldData + fieldSize - sizeof(int32_t));
+      haveTradingSession = true;
+
+      LOG_DEBUG("Parsed trading session info: changeNo=",
+                currentInstrument.changeNo);
+
+      instrCallback(currentInstrument);
+      return true;
     }
 
     case SnapshotFieldId::ORDERBOOK: {
-      if (!hasInstrument) {
-        // std::cout << "Warning: Received orderbook data without instrument
-        // info"
-        //           << std::endl;
-        break;
+      if (!haveInstrument || !haveTradingSession) {
+        LOG_WARN("Received orderbook without complete instrument info");
+        return false;
       }
 
-      const uint8_t *fieldData = data + offset;
-      size_t fieldOffset = 0;
-
-      int32_t orderbookInstrumentId =
-          *reinterpret_cast<const int32_t *>(fieldData + fieldOffset);
-      fieldOffset += sizeof(int32_t);
-
-      if (orderbookInstrumentId != instrumentId) {
-        std::cout << "Warning: Received orderbook data for different instrument"
-                  << std::endl;
-        break;
-      }
-
-      // Process orderbook entries
-      int processedEntries = 0;
-      while (fieldOffset + 9 <= fieldHeader->fieldLen) {
-        Side side = static_cast<Side>(fieldData[fieldOffset++]);
-
-        double price =
-            *reinterpret_cast<const double *>(fieldData + fieldOffset);
-        fieldOffset += sizeof(double);
-
-        int32_t volume =
-            *reinterpret_cast<const int32_t *>(fieldData + fieldOffset);
-        fieldOffset += sizeof(int32_t);
-
-        std::cout << "  Entry " << processedEntries
-                  << ": side=" << (side == Side::BID ? "BID" : "ASK")
-                  << ", price=" << price << ", volume=" << volume << std::endl;
-
-        // Call orderbook callback with correct instrument ID
-        orderbookCallback(orderbookInstrumentId, side, price, volume);
-        processedEntries++;
-      }
-
-      break;
+      return parseOrderbookField(fieldData, fieldSize,
+                                 currentInstrument.instrumentId,
+                                 orderbookCallback);
     }
+
     default:
-      std::cout << "Skipping unknown snapshot field ID 0x" << std::hex
-                << static_cast<uint16_t>(fieldId) << std::dec << std::endl;
-      break;
+      LOG_TRACE("Skipping unknown snapshot field: ", std::hex,
+                static_cast<int>(fieldId));
+      return true;
     }
+  };
 
-    // Move to next field
-    offset += fieldHeader->fieldLen;
-  }
-
-  if (offset < size) {
-    std::cout << "Warning: " << (size - offset)
-              << " bytes remaining after processing all fields" << std::endl;
-  }
+  processFields<SnapshotFieldId>(ctx, fieldHandler);
 }
 
 void ProtocolParser::parseUpdateMessage(
@@ -230,142 +191,177 @@ void ProtocolParser::parseUpdateMessage(
     const UpdateHeaderCallback &updateHeaderCallback,
     const UpdateEventCallback &updateEventCallback) {
 
-  size_t offset = 0;
-  bool hasHeader = false;
-  UpdateHeader currentHeader;
+  FieldContext ctx(data, size);
+  UpdateHeader currentHeader = {};
+  bool currentUpdateHeaderValid = false;
 
-  std::cout << "Parsing update message of size " << size << std::endl;
-
-  while (offset + sizeof(FieldHeader) <= size) {
-    const FieldHeader *fieldHeader =
-        reinterpret_cast<const FieldHeader *>(data + offset);
-    offset += sizeof(FieldHeader);
-
-    // if (offset + fieldLen > size) {
-    //   std::cout << "Not enough data for field ID " << std::hex << fieldId
-    //             << ", need " << fieldLen << " bytes, have " << (size -
-    //             offset)
-    //             << std::endl;
-    //   break;
-    // }
-
-    const uint8_t *fieldData = data + offset;
-
-    UpdateFieldId fieldId = static_cast<UpdateFieldId>(fieldHeader->fieldId);
+  auto fieldHandler = [&](UpdateFieldId fieldId, const uint8_t *fieldData,
+                          size_t fieldSize) {
     switch (fieldId) {
     case UpdateFieldId::UPDATE_HEADER: {
-      size_t headerOffset = 0;
+      currentUpdateHeaderValid = false;
+      currentHeader = {};
+      size_t headerFieldOffset = 0;
+
       try {
         // Parse instrument_id and change_no as VInts
-        currentHeader.instrumentId = decodeVInt(fieldData, headerOffset);
+        currentHeader.instrumentId =
+            decodeVInt(fieldData, headerFieldOffset, fieldSize);
 
-        if (headerOffset >= fieldHeader->fieldLen) {
-          std::cout << "Update header truncated after instrument_id"
-                    << std::endl;
-          break;
+        if (headerFieldOffset >= fieldSize) {
+          LOG_ERROR("Update header field too short for change_no");
+          return false;
         }
 
-        currentHeader.changeNo =
-            decodeVInt(fieldData + headerOffset, headerOffset);
+        currentHeader.changeNo = decodeVInt(fieldData, headerFieldOffset,
+                                            fieldSize - headerFieldOffset);
 
-        std::cout << "Update header: instrumentId="
-                  << currentHeader.instrumentId
-                  << ", changeNo=" << currentHeader.changeNo << std::endl;
+        LOG_DEBUG(
+            "Parsed update header: instrumentId=", currentHeader.instrumentId,
+            " changeNo=", currentHeader.changeNo);
 
-        if (headerOffset > fieldHeader->fieldLen) {
-          std::cout << "Update header truncated after change_no" << std::endl;
-          break;
-        }
-
-        hasHeader = true;
+        currentUpdateHeaderValid = true;
         updateHeaderCallback(currentHeader);
-        std::cout << "Found update header: instrumentId="
-                  << currentHeader.instrumentId
-                  << ", changeNo=" << currentHeader.changeNo << std::endl;
+        return true;
+
       } catch (const std::runtime_error &e) {
-        std::cout << "Error decoding update header: " << e.what() << std::endl;
+        LOG_ERROR("Failed to decode update header: ", e.what());
+        return false;
       }
-      break;
     }
+
     case UpdateFieldId::UPDATE_ENTRY: {
-      if (!hasHeader) {
-        std::cout << "Warning: Received update entry without header"
-                  << std::endl;
-        offset += fieldHeader->fieldLen;
-        continue;
+      if (!currentUpdateHeaderValid) {
+        LOG_WARN("Skipping update entry without valid header");
+        return false;
       }
 
-      if (fieldHeader->fieldLen < 4) {
-        std::cout << "Update entry field too short: " << fieldHeader->fieldLen
-                  << " bytes" << std::endl;
-        offset += fieldHeader->fieldLen;
-        continue;
-      }
-
-      size_t entryOffset = 0;
-
-      uint32_t processedEntries = 0;
-      while (entryOffset + 2 <= fieldHeader->fieldLen) {
-        try {
-          UpdateEvent event;
-          event.instrumentId = currentHeader.instrumentId;
-
-          // Read event type and side
-          event.eventType = static_cast<EventType>(fieldData[entryOffset++]);
-          std::cout << "Event type huhla: " << std::hex
-                    << static_cast<uint16_t>(event.eventType) << std::dec
-                    << std::endl;
-          event.side = static_cast<Side>(fieldData[entryOffset++]);
-
-          // Read price level, price offset, and volume as VInts
-          //   if (entryOffset >= fieldLen) {
-          //     std::cout << "Update entry truncated before price level"
-          //               << std::endl;
-          //     break;
-          //   }
-          event.priceLevel = decodeVInt(fieldData + entryOffset, entryOffset);
-
-          //   if (entryOffset >= fieldLen) {
-          //     std::cout << "Update entry truncated before price offset"
-          //               << std::endl;
-          //     break;
-          //   }
-          event.priceOffset = decodeVInt(fieldData + entryOffset, entryOffset);
-
-          //   if (entryOffset >= fieldLen) {
-          //     std::cout << "Update entry truncated before volume" <<
-          //     std::endl; break;
-          //   }
-          event.volume = decodeVInt(fieldData + entryOffset, entryOffset);
-
-          std::cout << "  Entry " << processedEntries << ": type="
-                    << (event.eventType == EventType::ADD      ? "ADD"
-                        : event.eventType == EventType::MODIFY ? "MODIFY"
-                                                               : "DELETE")
-                    << ", side=" << (event.side == Side::BID ? "BID" : "ASK")
-                    << ", level=" << event.priceLevel
-                    << ", offset=" << event.priceOffset
-                    << ", volume=" << event.volume << std::endl;
-
-          updateEventCallback(event);
-          processedEntries++;
-        } catch (const std::runtime_error &e) {
-          std::cout << "Error decoding update entry: " << e.what() << std::endl;
-          break;
-        }
-      }
-      break;
+      return parseUpdateEntryField(fieldData, fieldSize,
+                                   currentHeader.instrumentId,
+                                   updateEventCallback);
     }
-    default: {
-      std::cout << "Skipping unknown update field ID 0x" << std::hex
-                << static_cast<uint16_t>(fieldId) << std::dec << std::endl;
+
+    default:
+      LOG_TRACE("Skipping unknown update field: ", std::hex,
+                static_cast<int>(fieldId));
+      return true;
     }
+  };
+
+  processFields<UpdateFieldId>(ctx, fieldHandler);
+}
+
+bool ProtocolParser::parseOrderbookField(
+    const uint8_t *data, size_t size,
+    int32_t expectedInstrId, // ID from INSTRUMENT_INFO field
+    const SnapshotOrderbookCallback &callback) {
+
+  if (size < sizeof(int32_t)) {
+    LOG_ERROR("Orderbook field too short for instrument ID");
+    return false;
+  }
+
+  // Read instrument ID *ONCE* at the beginning of the field data
+  int32_t instrumentId = *reinterpret_cast<const int32_t *>(data);
+  if (instrumentId !=
+      expectedInstrId) { // Check against the one from INSTRUMENT_INFO
+    LOG_WARN("Mismatched instrument ID in orderbook: expected ",
+             expectedInstrId, " got ", instrumentId);
+    return false;
+  }
+
+  // Start offset *AFTER* the instrument ID
+  size_t offset = sizeof(int32_t);
+  const size_t LEVEL_SIZE = sizeof(OrderbookLevelLayout); // 13 bytes
+
+  while (offset + LEVEL_SIZE <= size) {
+    // Interpret remaining data as 13-byte layouts (Side, Price, Volume)
+    const auto *level =
+        reinterpret_cast<const OrderbookLevelLayout *>(data + offset);
+
+    Side side;
+    if (level->side == static_cast<char>(Side::BID)) {
+      side = Side::BID;
+    } else if (level->side == static_cast<char>(Side::ASK)) {
+      side = Side::ASK;
+    } else {
+      LOG_ERROR("Invalid side character in orderbook: ", level->side);
+      return false;
     }
-    offset += fieldHeader->fieldLen;
+
+    // Use the instrumentId read ONCE at the start for the callback
+    callback(instrumentId, side, level->price, level->volume);
+    offset += LEVEL_SIZE;
   }
 
   if (offset < size) {
-    std::cout << "Warning: " << (size - offset)
-              << " bytes remaining after processing all fields" << std::endl;
+    LOG_WARN("Partial level data remaining in orderbook: ", (size - offset),
+             " bytes");
   }
+
+  return true;
+}
+
+bool ProtocolParser::parseUpdateEntryField(
+    const uint8_t *data, size_t size, int64_t instrumentId,
+    const UpdateEventCallback &callback) {
+
+  if (size < 2) {
+    LOG_ERROR("Update entry field too short: ", size);
+    return false;
+  }
+
+  size_t offset = 0;
+  uint32_t processedEntries = 0;
+
+  while (offset + 2 <= size) {
+    try {
+      UpdateEvent event = {};
+      event.instrumentId = instrumentId;
+
+      // Read event type and side
+      event.eventType = static_cast<EventType>(data[offset++]);
+      event.side = static_cast<Side>(data[offset++]);
+
+      // Validate event type and side
+      if (event.eventType != EventType::ADD &&
+          event.eventType != EventType::MODIFY &&
+          event.eventType != EventType::DELETE) {
+        LOG_ERROR("Invalid event type: ", static_cast<char>(event.eventType));
+        return false;
+      }
+
+      if (event.side != Side::BID && event.side != Side::ASK) {
+        LOG_ERROR("Invalid side: ", static_cast<char>(event.side));
+        return false;
+      }
+
+      // Read VInts
+      event.priceLevel = decodeVInt(data, offset, size - offset);
+      event.priceOffset = decodeVInt(data, offset, size - offset);
+      event.volume = decodeVInt(data, offset, size - offset);
+
+      LOG_TRACE("Parsed update entry: type=",
+                (event.eventType == EventType::ADD      ? "ADD"
+                 : event.eventType == EventType::MODIFY ? "MODIFY"
+                                                        : "DELETE"),
+                " side=", (event.side == Side::BID ? "BID" : "ASK"),
+                " level=", event.priceLevel, " offset=", event.priceOffset,
+                " volume=", event.volume);
+
+      callback(event);
+      processedEntries++;
+
+    } catch (const std::runtime_error &e) {
+      LOG_ERROR("Failed to decode update entry: ", e.what());
+      return false;
+    }
+  }
+
+  if (offset < size) {
+    LOG_WARN("Partial data remaining in update entry: ", (size - offset),
+             " bytes");
+  }
+
+  return processedEntries > 0;
 }

@@ -101,10 +101,10 @@ private:
   // Calculate VWAP for an orderbook
   void calculateVWAP(Orderbook &orderbook);
 
-  // Add, modify, or delete price level
-  void addPriceLevel(Orderbook &orderbook, Side side, int priceLevel,
-                     double price, int32_t volume);
-  void modifyPriceLevel(Orderbook &orderbook, Side side, int priceLevel,
-                        double price, int32_t volume);
-  void deletePriceLevel(Orderbook &orderbook, Side side, int priceLevel);
+  // Add, modify, or delete price level (using 0-based index)
+  void addPriceLevel(Orderbook &orderbook, Side side, int priceLevelIndex,
+                     double price, int64_t volume);
+  void modifyPriceLevel(Orderbook &orderbook, Side side, int priceLevelIndex,
+                        double price, int64_t volume);
+  void deletePriceLevel(Orderbook &orderbook, Side side, int priceLevelIndex);
 };

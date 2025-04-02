@@ -10,6 +10,7 @@
 
 #include "orderbook.h"
 #include "pcap_reader.h"
+#include "protocol_logger.h"
 #include "protocol_parser.h"
 #include "shared_queue.h"
 
@@ -202,33 +203,44 @@ int debugPcapReading(const std::string &pcapFilename,
 #endif
 
 int main(int argc, char *argv[]) {
+  // Log the compile-time log level
+  LOG_INFO("Application started with compile-time log level: ",
+           COMPILE_TIME_LOG_LEVEL_STR);
+
+  // --- Argument Parsing (Simplified) ---
+  std::vector<std::string> args(argv + 1, argv + argc); // Exclude program name
+
+  // --- Mode Selection based on remaining args ---
 #if DEBUG_PCAP_READING
-  // If args provided for debug mode
-  if (argc == 3) {
-    return debugPcapReading(argv[1], argv[2]);
-  } else if (argc > 1 && argc < 3) {
-    std::cerr << "Debug mode usage: " << argv[0]
-              << " <pcap_file> <metadata_path>" << std::endl;
-    return 1;
+  // If args match debug mode (2 args: pcap, metadata)
+  if (args.size() == 2) {
+    LOG_INFO("Running in DEBUG_PCAP_READING mode.");
+    return debugPcapReading(args[0], args[1]);
   }
 #endif
 
-  // Normal mode - check arguments
-  if (argc != 7) {
+  // Check for normal mode arguments (6 args)
+  if (args.size() != 6) {
     std::cerr << "Usage: " << argv[0]
               << " <input_header> <input_buffer> <output_header> "
                  "<output_buffer> <buffer_size> <metadata_path>"
               << std::endl;
+#if DEBUG_PCAP_READING
+    std::cerr << "   or: " << argv[0] << " <pcap_file> <metadata_path>"
+              << std::endl;
+#endif
     return 1;
   }
 
+  // Normal mode
+  LOG_INFO("Running in normal mode.");
   try {
-    std::string inputHeaderPath = argv[1];
-    std::string inputBufferPath = argv[2];
-    std::string outputHeaderPath = argv[3];
-    std::string outputBufferPath = argv[4];
-    size_t bufferSize = std::stoull(argv[5]);
-    std::string metadataPath = argv[6];
+    std::string inputHeaderPath = args[0];
+    std::string inputBufferPath = args[1];
+    std::string outputHeaderPath = args[2];
+    std::string outputBufferPath = args[3];
+    size_t bufferSize = std::stoull(args[4]);
+    std::string metadataPath = args[5];
 
     // Create shared queues
     SharedQueue inputQueue(inputHeaderPath, inputBufferPath, bufferSize, false);
