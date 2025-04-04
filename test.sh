@@ -6,8 +6,8 @@
 set -e
 
 # --- Configuration ---
-SOLUTION_BIN="./solution/build/solution"
-DUMPER_BIN="./solution/build/pcap_dumper"
+SOLUTION_BIN="./solution/build_debug/solution"
+DUMPER_BIN="./solution/build_debug/pcap_dumper"
 DATA_DIR="./lat-spring-data"
 RESULTS_DIR="./results"
 
@@ -68,9 +68,12 @@ run_pcap_direct_test() {
   local meta_path="${DATA_DIR}/${file}.meta"
   local log_path="${RESULTS_DIR}/${file}_direct.log"
   echo "=== Running direct PCAP processing test for ${file}.pcapng ==="
+  echo "Setting LSAN_OPTIONS=verbosity=1:log_threads=1"
+  export LSAN_OPTIONS="verbosity=1:log_threads=1" # Set LSAN options
   echo "Command: ${SOLUTION_BIN} ${pcap_path} ${meta_path} &> ${log_path}"
   "${SOLUTION_BIN}" "${pcap_path}" "${meta_path}" &> "${log_path}"
   echo "Results saved to ${log_path}"
+  unset LSAN_OPTIONS # Unset for subsequent tests if needed
 }
 
 run_dumper_test() {
@@ -83,12 +86,13 @@ run_dumper_test() {
   IP1=$(head -n 1 "${meta_path}" | awk '{print $1}')
   IP2=$(head -n 1 "${meta_path}" | awk '{print $2}')
   if [ -z "$IP1" ] || [ -z "$IP2" ]; then
-      echo "Error: Could not extract IPs from ${meta_path}" 
+      echo "Error: Could not extract IPs from ${meta_path}"
       exit 1
-  fi 
+  fi
   echo "Using IPs: $IP1 and $IP2"
 
   echo "=== Running PCAP dumper test for ${file}.pcapng ==="
+  # Note: Dumper might not be built with ASAN/LSAN, so adding options might not have effect
   echo "Command: ${DUMPER_BIN} ${pcap_path} ${IP1} ${IP2} &> ${log_path}"
   "${DUMPER_BIN}" "${pcap_path}" "${IP1}" "${IP2}" &> "${log_path}"
   echo "Results saved to ${log_path}"
@@ -96,51 +100,57 @@ run_dumper_test() {
 
 run_shm_test() {
   local file=$1
+  local pcap_path="${DATA_DIR}/${file}.pcapng"
   local meta_path="${DATA_DIR}/${file}.meta"
-  local log_path="${RESULTS_DIR}/${file}_shm.log"
-  echo "=== Running shared memory test simulation for ${file}.pcapng ==="
+  local runner_log_path="${RESULTS_DIR}/${file}_runner.log"
+  local runner_another_log_path="${RESULTS_DIR}/${file}_runner_another.log"
+  # Use absolute path inside container
+  local runner_bin="/app/runner" # Runner location inside the container
 
-  # Define SHM parameters
-  BUFFER_PREFIX="test_buffer_local_${file}" 
-  SHM_DIR="/dev/shm" 
-  INPUT_HEADER="${SHM_DIR}/${BUFFER_PREFIX}_input_header"
-  INPUT_BUFFER="${SHM_DIR}/${BUFFER_PREFIX}_input_buffer"
-  OUTPUT_HEADER="${SHM_DIR}/${BUFFER_PREFIX}_output_header"
-  OUTPUT_BUFFER="${SHM_DIR}/${BUFFER_PREFIX}_output_buffer"
-  BUFFER_SIZE=16777216
+  echo "=== Running shared memory test via runner for ${file}.pcapng (Hugepages Disabled) ==="
 
-  # Cleanup previous SHM files if they exist
-  echo "--- Cleaning up potential old SHM files ---"
-  rm -f "${INPUT_HEADER}" "${INPUT_BUFFER}" "${OUTPUT_HEADER}" "${OUTPUT_BUFFER}"
-
-  # Create dummy files (runner would normally do this)
-  echo "--- Creating dummy SHM files (simulation) ---"
-  touch "${INPUT_HEADER}" "${INPUT_BUFFER}" "${OUTPUT_HEADER}" "${OUTPUT_BUFFER}"
-
-  echo "--- Running solution with SHM arguments (simulation) ---"
-  # NOTE: This assumes the solution binary can accept SHM arguments directly.
-  # A full SHM test requires the external 'runner' binary.
-  echo "Command: ${SOLUTION_BIN} ${INPUT_HEADER} ${INPUT_BUFFER} ${OUTPUT_HEADER} ${OUTPUT_BUFFER} ${BUFFER_SIZE} ${meta_path} | tee ${log_path}"
-  # Run in background to allow cleanup, but capture output
-  ( "${SOLUTION_BIN}" "${INPUT_HEADER}" "${INPUT_BUFFER}" "${OUTPUT_HEADER}" "${OUTPUT_BUFFER}" "${BUFFER_SIZE}" "${meta_path}" &> "${log_path}" ) &
-  SOLUTION_PID=$!
-  echo "Solution running in background (PID: ${SOLUTION_PID}), outputting to ${log_path}"
-  echo "Waiting a few seconds for the process to potentially run... (This is a simple simulation)"
-  sleep 3 # Give the process a moment to run/fail
-
-  # Check if process is still running (optional)
-  if kill -0 $SOLUTION_PID 2>/dev/null; then
-      echo "Solution process still running (PID: ${SOLUTION_PID}). This test only simulates startup."
-      # Optionally kill it if needed for cleanup simulation
-      # kill $SOLUTION_PID
-  else
-      echo "Solution process (PID: ${SOLUTION_PID}) finished or failed to start."
+  # Check if runner binary exists
+  if [ ! -x "${runner_bin}" ]; then
+      echo "Error: Runner binary not found or not executable at ${runner_bin}"
+      echo "Skipping SHM runner test for ${file}."
+      return # Skip this test if runner not found
   fi
 
-  echo "--- Cleaning up SHM files ---"
-  rm -f "${INPUT_HEADER}" "${INPUT_BUFFER}" "${OUTPUT_HEADER}" "${OUTPUT_BUFFER}"
+  # Define SHM parameters for the runner's -b flag
+  BUFFER_PREFIX="test_buffer_runner_${file}_no_huge" # Optional: change prefix slightly
 
-  echo "SHM test simulation finished. Check results in ${log_path}"
+  # Construct the runner command, adding -disable-hugepages
+  local runner_cmd=(
+      "${runner_bin}"
+      -sol "${SOLUTION_BIN}"
+      -meta "${meta_path}"
+      -b "${BUFFER_PREFIX}"
+      -disable-hugepages # <-- ADDED THIS FLAG
+      -o "${runner_another_log_path}" # Direct runner output if needed
+      "${pcap_path}"
+  )
+
+  echo "Setting LSAN_OPTIONS=verbosity=1:log_threads=1"
+  export LSAN_OPTIONS="verbosity=1:log_threads=1" # Set LSAN options for runner & solution
+
+  echo "Command: ${runner_cmd[@]}"
+
+  # Execute the runner command
+  if "${runner_cmd[@]}" > "${runner_log_path}" 2>&1; then
+      echo "Runner finished successfully. Check results/output in ${runner_log_path}"
+  else
+      echo "Runner failed. Check error details in ${runner_log_path}"
+      # tail "${runner_log_path}" # Uncomment to see log on failure
+  fi
+
+  unset LSAN_OPTIONS # Unset for subsequent tests
+
+  # Cleanup SHM files - only /dev/shm should be relevant now
+  echo "--- Attempting cleanup of potential SHM files (/dev/shm/${BUFFER_PREFIX}*) ---"
+  rm -f "/dev/shm/${BUFFER_PREFIX}"*
+  # No need to check /dev/hugepages anymore
+
+  echo "SHM runner test finished for ${file}. Check logs in ${RESULTS_DIR}"
 }
 
 # --- Execute Tests ---

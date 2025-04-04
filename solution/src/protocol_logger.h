@@ -1,6 +1,7 @@
 #pragma once
 #include <iostream>
-#include <string> // Include for std::string usage if needed later
+#include <sstream> // Include for std::ostringstream
+#include <string>  // Include for std::string usage if needed later
 
 // Logging levels
 enum class LogLevel : int { // Use int for easier compile-time definition
@@ -23,16 +24,19 @@ constexpr LogLevel CT_LOG_LEVEL = static_cast<LogLevel>(COMPILE_TIME_LOG_LEVEL);
 
 class ProtocolLogger {
 public:
-  // Log function remains, but check is now implicit via macros
   template <typename... Args>
   static void log(LogLevel level, const char *file, int line, Args... args) {
-    // This check is technically redundant if macros are used correctly,
-    // but kept as a safeguard or if log() is called directly.
+    // Compile-time check remains the primary optimization
     if (static_cast<int>(level) <= COMPILE_TIME_LOG_LEVEL) {
-      std::cerr << "[" << levelToString(level) << "] " << file << ":" << line
-                << " - ";
-      (std::cerr << ... << args);
-      std::cerr << std::endl;
+      std::ostringstream oss;
+      oss << "[" << levelToString(level) << "] " << file << ":" << line
+          << " - ";
+      // Use fold expression to append all arguments to the ostringstream
+      (oss << ... << args);
+      oss << '\n'; // Add newline
+
+      // Write the entire formatted string to std::clog in one go
+      std::clog << oss.str();
     }
   }
 
@@ -43,22 +47,19 @@ public:
     case LogLevel::ERROR:
       return "ERROR";
     case LogLevel::WARN:
-      return "WARN ";
+      return "WARN";
     case LogLevel::INFO:
-      return "INFO ";
+      return "INFO";
     case LogLevel::DEBUG:
       return "DEBUG";
     case LogLevel::TRACE:
       return "TRACE";
     default:
-      return "NONE ";
+      return "NONE";
     }
   }
 
 private:
-  // No static currentLevel needed anymore
-  // No setGlobalLogLevel needed anymore
-  // No getLevel needed anymore
 };
 
 // Logging macros - Conditionally compile the log call

@@ -5,8 +5,7 @@
 class OrderbookManager;
 
 #include <cstdint>
-#include <functional>
-#include <stdexcept> // For runtime_error in decodeVInt
+#include <stdexcept> // For runtime_error
 #include <string>
 #include <vector>
 
@@ -133,91 +132,14 @@ public:
 private:
   OrderbookManager &manager_; // Reference to the manager
 
-  // Structure to track field parsing state
-  struct FieldContext {
-    const uint8_t *data;      // Base pointer to message data
-    size_t size;              // Total message size
-    size_t offset;            // Current offset in message
-    size_t fieldSize;         // Size of current field
-    const uint8_t *fieldData; // Pointer to current field data
-
-    FieldContext(const uint8_t *d, size_t s)
-        : data(d), size(s), offset(0), fieldSize(0), fieldData(nullptr) {}
-
-    bool canReadField() const { return offset + sizeof(FieldHeader) <= size; }
-
-    bool advanceField(const FieldHeader *header) {
-      if (offset + sizeof(FieldHeader) + header->fieldLen > size) {
-        return false;
-      }
-      offset += sizeof(FieldHeader);
-      fieldSize = header->fieldLen;
-      fieldData = data + offset;
-      return true;
-    }
-
-    void nextField() { offset += fieldSize; }
-  };
-
-  // Template declarations
   template <typename T>
   static const T *getFieldPtr(const uint8_t *data, size_t offset, size_t size);
 
-  template <typename FieldIdType>
-  bool processFields(
-      FieldContext &ctx,
-      const std::function<bool(FieldIdType, const uint8_t *, size_t)> &handler);
-
   // Non-template method declarations
-  void parseSnapshotMessage(const uint8_t *data,
-                            size_t size); // Removed callbacks
-  void parseUpdateMessage(const uint8_t *data,
-                          size_t size); // Removed callbacks
+  void parseSnapshotMessage(const uint8_t *data, size_t size);
+  void parseUpdateMessage(const uint8_t *data, size_t size);
 
-  // These helpers now need access to manager_, so make them non-static members
   bool parseOrderbookField(const uint8_t *data, size_t size,
-                           int32_t expectedInstrId); // Removed callback
-  bool parseUpdateEntryField(const uint8_t *data, size_t size,
-                             int64_t instrumentId); // Removed callback
+                           int32_t expectedInstrId);
+  // parseUpdateEntryField removed - logic moved inline
 };
-
-// Template implementations
-template <typename T>
-const T *ProtocolParser::getFieldPtr(const uint8_t *data, size_t offset,
-                                     size_t size) {
-  if (offset + sizeof(T) > size) {
-    throw std::runtime_error("Field access beyond buffer");
-  }
-  return reinterpret_cast<const T *>(data + offset);
-}
-
-template <typename FieldIdType>
-bool ProtocolParser::processFields(
-    FieldContext &ctx,
-    const std::function<bool(FieldIdType, const uint8_t *, size_t)> &handler) {
-  while (ctx.canReadField()) {
-    const FieldHeader *header =
-        getFieldPtr<FieldHeader>(ctx.data, ctx.offset, ctx.size);
-
-    if (!ctx.advanceField(header)) {
-      LOG_ERROR("Incomplete field data at offset ", ctx.offset);
-      return false;
-    }
-
-    FieldIdType fieldId = static_cast<FieldIdType>(header->fieldId);
-    LOG_TRACE("Processing field ", std::hex, static_cast<int>(header->fieldId),
-              " size=", std::dec, header->fieldLen);
-
-    if (!handler(fieldId, ctx.fieldData, ctx.fieldSize)) {
-      LOG_WARN("Field handler failed for field ", std::hex,
-               static_cast<int>(header->fieldId));
-      // Continue processing other fields
-    }
-
-    ctx.nextField();
-  }
-  return true;
-}
-
-// Include OrderbookManager definitions *after* ProtocolParser declaration
-#include "orderbook.h"

@@ -275,66 +275,142 @@ static int processFrameCallback(const light_packet_header *frame_header,
                                 const FrameCallback &callback,
                                 uint32_t snapshotIP, uint32_t updateIP,
                                 bool filterByIP) {
-  std::cout << "Processing frame: captured_length="
-            << frame_header->captured_length
-            << ", original_length=" << frame_header->original_length
-            << std::endl;
+  // std::cout << "Processing frame: captured_length=" // Debug
+  //           << frame_header->captured_length       // Debug
+  //           << ", original_length=" << frame_header->original_length // Debug
+  //           << std::endl;                          // Debug
 
   // Process Ethernet, IP, and UDP headers
   if (frame_header->captured_length <
-      sizeof(EthernetHeader) + sizeof(IPv4Header) + sizeof(UDPHeader)) {
-    std::cout << "Frame too small, skipping (size="
-              << frame_header->captured_length << ", required="
-              << (sizeof(EthernetHeader) + sizeof(IPv4Header) +
-                  sizeof(UDPHeader))
-              << ")" << std::endl;
-    return 0; // Too small, skip
+      sizeof(EthernetHeader) +
+          sizeof(IPv4Header)) { // Check only Eth+IP header initially
+    // std::cout << "Frame too small for Eth+IP, skipping (size=" // Debug
+    //           << frame_header->captured_length << ", required=" // Debug
+    //           << (sizeof(EthernetHeader) + sizeof(IPv4Header)) // Debug
+    //           << ")" << std::endl;                             // Debug
+
+    return 0; // Too small for IP header, skip
   }
 
   const EthernetHeader *ethHeader =
       reinterpret_cast<const EthernetHeader *>(frame_data);
 
+  // Check for IPv4 (etherType = 0x0800 in network byte order)
+  if (ntohs(ethHeader->etherType) != 0x0800 /* ETHERTYPE_IP */) {
+    // std::cout << "Not an IPv4 frame (EtherType: 0x" << std::hex // Debug
+    //           << ntohs(ethHeader->etherType) << std::dec << "), skipping" //
+    //           Debug
+    //           << std::endl;                                // Debug
+
+    return 0; // Skip non-IPv4
+  }
+
   const IPv4Header *ipHeader =
       reinterpret_cast<const IPv4Header *>(frame_data + sizeof(EthernetHeader));
 
-  // Print IP header information
-  uint32_t srcIP = ntohl(ipHeader->sourceIP);
-  uint32_t dstIP = ntohl(ipHeader->destIP);
+  // Check IP version and header length validity
+  uint8_t ipVersion = ipHeader->versionAndIHL >> 4;
+  uint8_t ipHeaderLength = (ipHeader->versionAndIHL & 0x0F) * 4;
+  if (ipVersion != 4 || ipHeaderLength < sizeof(IPv4Header)) {
+    // std::cout << "Invalid IPv4 header (Version: " << (int)ipVersion // Debug
+    //           << ", IHL: " << (int)ipHeaderLength << "), skipping" <<
+    //           std::endl; // Debug
+    return 0; // Invalid IP header
+  }
+  // Ensure entire IP header is captured
+  if (sizeof(EthernetHeader) + ipHeaderLength > frame_header->captured_length) {
+    // std::cout << "Truncated IP header, skipping" << std::endl; // Debug
+    return 0; // Truncated IP header
+  }
 
-  // If filtering by IP, check if this frame matches our target IPs
+  // Get IPs in Network Byte Order (NBO) for filtering
+  uint32_t srcIPNBO = ipHeader->sourceIP;
+  uint32_t dstIPNBO = ipHeader->destIP;
+
+  // If filtering by IP, check if this frame matches our target IPs (using NBO)
   if (filterByIP) {
-    std::cout << "Checking IPs: src=0x" << std::hex << srcIP << ", dst=0x"
-              << dstIP << std::dec << std::endl;
+    // Note: snapshotIP and updateIP are already NBO from FrameProcessor
+    // std::cout << "Checking IPs (NBO): src=0x" << std::hex << srcIPNBO << ",
+    // dst=0x" // Debug
+    //           << dstIPNBO << ", snapshot=0x" << snapshotIP << ", update=0x"
+    //           // Debug
+    //           << updateIP << std::dec << std::endl; // Debug
 
-    // Check both source and destination IPs against both target IPs
-    bool matchFound = (srcIP == snapshotIP || srcIP == updateIP ||
-                       dstIP == snapshotIP || dstIP == updateIP);
+    bool matchFound = (srcIPNBO == snapshotIP || srcIPNBO == updateIP ||
+                       dstIPNBO == snapshotIP || dstIPNBO == updateIP);
 
     if (!matchFound) {
-      std::cout << "No IP match found, skipping" << std::endl;
-      return 0;
+      // std::cout << "No IP match found, skipping" << std::endl; // Debug
+      return 0; // Skip based on IP filter
     }
   }
 
-  const UDPHeader *udpHeader =
-      reinterpret_cast<const UDPHeader *>(frame_data + sizeof(EthernetHeader) +
-                                          (ipHeader->versionAndIHL & 0x0F) * 4);
+  // Check for UDP protocol (17)
+  if (ipHeader->protocol != 17 /* IPPROTO_UDP */) {
+    // std::cout << "Not a UDP packet (Proto: " << (int)ipHeader->protocol <<
+    // "), skipping" << std::endl; // Debug
+    return 0; // Skip non-UDP packet
+  }
 
-  // Calculate payload offset and length
-  size_t headerOffset = sizeof(EthernetHeader) +
-                        (ipHeader->versionAndIHL & 0x0F) * 4 +
-                        sizeof(UDPHeader);
-  size_t payloadLength = ntohs(udpHeader->length) - sizeof(UDPHeader);
+  // Ensure UDP header is fully captured
+  if (sizeof(EthernetHeader) + ipHeaderLength + sizeof(UDPHeader) >
+      frame_header->captured_length) {
+    // std::cout << "Truncated UDP header, skipping" << std::endl; // Debug
+    return 0; // UDP header truncated
+  }
 
-  std::cout << "Header offset: " << headerOffset << std::endl;
-  std::cout << "Payload length: " << payloadLength << std::endl;
+  const UDPHeader *udpHeader = reinterpret_cast<const UDPHeader *>(
+      frame_data + sizeof(EthernetHeader) + ipHeaderLength);
 
-  // Call the callback with payload data and IP addresses
-  callback(frame_data + headerOffset, payloadLength, srcIP, dstIP);
-  std::cout << "Successfully processed frame with payload length "
-            << payloadLength << std::endl;
+  // Calculate payload offset
+  size_t headerOffset =
+      sizeof(EthernetHeader) + ipHeaderLength + sizeof(UDPHeader);
 
-  return 1;
+  // Calculate payload length declared in UDP header
+  uint16_t udpTotalLength = ntohs(udpHeader->length);
+  size_t udpDeclaredPayloadLength = 0;
+  if (udpTotalLength >= sizeof(UDPHeader)) {
+    udpDeclaredPayloadLength = udpTotalLength - sizeof(UDPHeader);
+  } else {
+    // std::cout << "Invalid UDP header length (" << udpTotalLength << "),
+    // skipping" << std::endl; // Debug
+    return 0; // Invalid UDP length field
+  }
+
+  // Calculate actual available payload length based on captured frame size
+  size_t maxPossiblePayloadLength = 0;
+  if (frame_header->captured_length >=
+      headerOffset) { // Use >= to allow zero-length payload
+    maxPossiblePayloadLength = frame_header->captured_length - headerOffset;
+  } else {
+    // This case should be caught by the header checks above, but included for
+    // safety std::cout << "Header offset exceeds captured length (" <<
+    // headerOffset << " > " // Debug
+    //           << frame_header->captured_length << "), skipping" << std::endl;
+    //           // Debug
+
+    return 0;
+  }
+
+  // Use the smaller of the declared UDP payload length and the actual available
+  // length
+  size_t finalPayloadLength =
+      std::min(udpDeclaredPayloadLength, maxPossiblePayloadLength);
+
+  // std::cout << "Header offset: " << headerOffset << std::endl; // Debug
+  // std::cout << "UDP Declared Payload length: " << udpDeclaredPayloadLength <<
+  // std::endl; // Debug std::cout << "Max Possible Payload length: " <<
+  // maxPossiblePayloadLength << std::endl; // Debug std::cout << "Final Payload
+  // length: " << finalPayloadLength << std::endl; // Debug
+
+  // Call the callback with payload data pointer, calculated payload length, and
+  // NBO IPs The callback lambda in FrameProcessor uses NBO IPs for its
+  // isSnapshot check.
+  callback(frame_data + headerOffset, finalPayloadLength, srcIPNBO, dstIPNBO);
+  // std::cout << "Successfully processed frame with payload length " // Debug
+  //           << finalPayloadLength << std::endl;                    // Debug
+
+  return 1; // Indicate success
 }
 
 // Constructor

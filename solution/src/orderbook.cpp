@@ -30,56 +30,6 @@ OrderbookManager::OrderbookManager() : snapshotIP(0), updateIP(0) {
   LOG_INFO("OrderbookManager created.");
 }
 
-// Load metadata (IPs and instrument names)
-void OrderbookManager::loadMetadata(const std::string &metadataPath) {
-  LOG_INFO("Loading metadata from: ", metadataPath);
-  std::ifstream file(metadataPath);
-  if (!file.is_open()) {
-    LOG_ERROR("Failed to open metadata file: ", metadataPath);
-    throw std::runtime_error("Failed to open metadata file: " + metadataPath);
-  }
-
-  std::string line;
-
-  // Read IPs from the first line
-  if (std::getline(file, line)) {
-    std::istringstream iss(line);
-    std::string ip1, ip2;
-    if (iss >> ip1 >> ip2) {
-      snapshotIP =
-          ipStringToUint32(ip1); // Assumes ipStringToUint32 is available
-      updateIP = ipStringToUint32(ip2);
-      LOG_INFO("Loaded IPs: snapshot=", ip1, " update=", ip2);
-    } else {
-      LOG_ERROR("Failed to parse IPs from metadata");
-      throw std::runtime_error("Failed to parse IPs from metadata");
-    }
-  } else {
-    LOG_ERROR("Metadata file is empty or missing IP line");
-    throw std::runtime_error("Metadata file is empty or missing IP line");
-  }
-
-  // Read tracked instruments
-  int instrumentCount = 0;
-  while (std::getline(file, line)) {
-    if (!line.empty()) {
-      // Remove any trailing whitespace
-      line.erase(
-          std::find_if(line.rbegin(), line.rend(),
-                       [](unsigned char ch) { return !std::isspace(ch); })
-              .base(),
-          line.end());
-
-      if (!line.empty()) {
-        trackedInstruments.insert(line);
-        LOG_DEBUG("Tracking instrument: '", line, "'");
-        instrumentCount++;
-      }
-    }
-  }
-  LOG_INFO("Total tracked instruments: ", instrumentCount);
-}
-
 // Check if an instrument name is tracked
 bool OrderbookManager::isTrackedInstrument(const std::string &name) const {
   return trackedInstruments.count(name) > 0;
@@ -110,18 +60,22 @@ void OrderbookManager::processSnapshotInfo(const InstrumentInfo &info) {
       instrName.end());
 
   LOG_DEBUG("Processing snapshot info for instrument '", instrName,
-            "' (ID: ", info.instrumentId, ")");
+            "' (id=", info.instrumentId, ")");
 
   // Skip if not tracked
   if (!isTrackedInstrument(instrName)) {
     LOG_TRACE("Skipping untracked instrument: '", instrName, "'");
     // Clear any potentially cached updates for this untracked ID
     cachedParsedUpdates.erase(info.instrumentId);
+    idToName.erase(
+        info.instrumentId); // Also remove ID->name mapping if untracked
+    orderbooks.erase(
+        info.instrumentId); // Remove any potentially existing invalid book
     return;
   }
 
-  LOG_INFO("Applying snapshot for tracked instrument '", instrName,
-           "' (ID: ", info.instrumentId, ")");
+  LOG_INFO("Applying snapshot info for tracked instrument '", instrName,
+           "' (id=", info.instrumentId, ")");
 
   // Create or get orderbook entry
   auto &orderbook = orderbooks[info.instrumentId]; // Creates if not exists
@@ -130,7 +84,7 @@ void OrderbookManager::processSnapshotInfo(const InstrumentInfo &info) {
   orderbook.instrumentId = info.instrumentId;
   orderbook.tickSize = info.tickSize;
   orderbook.referencePrice = info.referencePrice;
-  orderbook.changeNo = info.changeNo;
+  orderbook.changeNo = -1;  // Initialize changeNo, expecting update later
   orderbook.isValid = true; // Mark as valid *after* applying snapshot base info
   orderbook.askCount = 0;   // Clear existing levels
   orderbook.bidCount = 0;
@@ -147,9 +101,9 @@ void OrderbookManager::processSnapshotInfo(const InstrumentInfo &info) {
   // Track ID to name mapping
   idToName[info.instrumentId] = instrName;
 
-  LOG_DEBUG("Initialized/Reset orderbook from snapshot info: ID=",
-            info.instrumentId, " ChangeNo=", info.changeNo,
-            " TickSize=", info.tickSize, " RefPrice=", info.referencePrice);
+  LOG_DEBUG(
+      "Initialized/Reset orderbook from snapshot info: id=", info.instrumentId,
+      " TickSize=", info.tickSize, " RefPrice=", info.referencePrice);
 
   // VWAP calculation and cached update application happen in finalizeSnapshot
 }
@@ -161,14 +115,14 @@ void OrderbookManager::processSnapshotOrderbook(int32_t instrumentId, Side side,
   // tracked instrument
   auto it = orderbooks.find(instrumentId);
   if (it == orderbooks.end() || !isTrackedInstrumentId(instrumentId)) {
-    LOG_WARN("Received snapshot OB entry for unknown/untracked ID: ",
+    LOG_WARN("Received snapshot OB entry for unknown/untracked id=",
              instrumentId);
     return;
   }
 
   Orderbook &orderbook = it->second;
   const char *sideStr = (side == Side::BID) ? "BID" : "ASK";
-  LOG_TRACE("Processing snapshot OB entry: ID=", instrumentId,
+  LOG_TRACE("Processing snapshot OB entry: id=", instrumentId,
             " Side=", sideStr, " Price=", price, " Volume=", volume);
 
   if (side == Side::BID) {
@@ -176,7 +130,7 @@ void OrderbookManager::processSnapshotOrderbook(int32_t instrumentId, Side side,
       orderbook.bids[orderbook.bidCount++] = {
           price, static_cast<int64_t>(volume)}; // Cast volume
     } else {
-      LOG_WARN("Snapshot provides more than MAX_PRICE_LEVELS BIDs for ID: ",
+      LOG_WARN("Snapshot provides more than MAX_PRICE_LEVELS BIDs for id=",
                instrumentId);
     }
   } else { // ASK
@@ -184,7 +138,7 @@ void OrderbookManager::processSnapshotOrderbook(int32_t instrumentId, Side side,
       orderbook.asks[orderbook.askCount++] = {
           price, static_cast<int64_t>(volume)}; // Cast volume
     } else {
-      LOG_WARN("Snapshot provides more than MAX_PRICE_LEVELS ASKs for ID: ",
+      LOG_WARN("Snapshot provides more than MAX_PRICE_LEVELS ASKs for id=",
                instrumentId);
     }
   }
@@ -193,14 +147,27 @@ void OrderbookManager::processSnapshotOrderbook(int32_t instrumentId, Side side,
 // Finalize snapshot processing for a given instrument
 void OrderbookManager::finalizeSnapshot(int32_t instrumentId) {
   auto it = orderbooks.find(instrumentId);
+  // Check if tracked AND valid before finalizing
+  if (!isTrackedInstrumentId(instrumentId)) {
+    LOG_TRACE("Skipping finalizeSnapshot for untracked id=", instrumentId);
+    return;
+  }
   if (it == orderbooks.end() || !it->second.isValid) {
-    LOG_ERROR("Finalize snapshot called for unknown or invalid ID: ",
+    LOG_ERROR("Finalize snapshot called for unknown or invalid tracked id=",
               instrumentId);
     return;
   }
+  // Also check if changeNo was set (meaning TRADING_SESSION_INFO was received)
+  if (it->second.changeNo == -1) {
+    LOG_WARN("Finalizing snapshot for ID ", instrumentId,
+             " but changeNo was never set (missing TRADING_SESSION_INFO "
+             "field?). Proceeding anyway.");
+  }
+
   Orderbook &orderbook = it->second;
 
-  LOG_DEBUG("Finalizing snapshot application for ID: ", instrumentId,
+  LOG_DEBUG("Finalizing snapshot application for id=", instrumentId,
+            " ChangeNo: ", orderbook.changeNo,
             " Bid Levels=", orderbook.bidCount,
             " Ask Levels=", orderbook.askCount);
 
@@ -210,7 +177,7 @@ void OrderbookManager::finalizeSnapshot(int32_t instrumentId) {
   // 2. Store this initial VWAP state as the baseline "last" state
   orderbook.lastVwapNumerator = orderbook.vwapNumerator;
   orderbook.lastVwapDenominator = orderbook.vwapDenominator;
-  orderbook.vwapChanged = false;
+  orderbook.vwapChanged = false; // Reset flag, as this is the baseline
 
   LOG_DEBUG("Initial VWAP calculated post-snapshot for ID ", instrumentId, ": ",
             orderbook.vwapNumerator, "/", orderbook.vwapDenominator);
@@ -226,7 +193,7 @@ void OrderbookManager::applyCachedUpdates(Orderbook &orderbook) {
     return; // No cached updates
   }
 
-  LOG_INFO("Applying cached updates for ID: ", orderbook.instrumentId,
+  LOG_INFO("Applying cached updates for id=", orderbook.instrumentId,
            " Current ChangeNo: ", orderbook.changeNo,
            " Cached Count: ", cacheIt->second.size());
 
@@ -244,7 +211,7 @@ void OrderbookManager::applyCachedUpdates(Orderbook &orderbook) {
     }
 
     if (queue_it->changeNo == orderbook.changeNo + 1) {
-      LOG_INFO("Applying cached update ID: ", orderbook.instrumentId,
+      LOG_INFO("Applying cached update id=", orderbook.instrumentId,
                " ChangeNo: ", queue_it->changeNo);
 
       // Store state *before* applying this cached update
@@ -300,20 +267,20 @@ void OrderbookManager::applyCachedUpdates(Orderbook &orderbook) {
       appliedCount++;
 
     } else if (queue_it->changeNo <= orderbook.changeNo) {
-      LOG_WARN("Discarding old/duplicate cached update for ID: ",
+      LOG_WARN("Discarding old/duplicate cached update for id=",
                orderbook.instrumentId, " Cached ChangeNo: ", queue_it->changeNo,
                " Book ChangeNo: ", orderbook.changeNo);
       queue_it = cachedQueue.erase(queue_it);
     } else { // Gap detected
       LOG_INFO(
-          "Stopping cached update application for ID: ", orderbook.instrumentId,
+          "Stopping cached update application for id=", orderbook.instrumentId,
           " Gap detected. Expected: ", orderbook.changeNo + 1,
           " Found: ", queue_it->changeNo);
       break; // Since sorted, no more can apply
     }
   }
 
-  LOG_INFO("Finished applying cached updates for ID: ", orderbook.instrumentId,
+  LOG_INFO("Finished applying cached updates for id=", orderbook.instrumentId,
            ". Applied ", appliedCount,
            " updates. Remaining cached: ", cachedQueue.size());
   if (cachedQueue.empty()) {
@@ -344,20 +311,20 @@ void OrderbookManager::handleUpdateMessage(
                       (bookIsValid && header.changeNo != expectedChangeNo);
 
   if (bookIsValid && header.changeNo <= currentChangeNo) {
-    LOG_WARN("Received old update message for ID: ", header.instrumentId,
+    LOG_WARN("Received old update message for id=", header.instrumentId,
              " Received ChangeNo: ", header.changeNo,
              " Book ChangeNo: ", currentChangeNo, ". Discarding.");
     return; // Discard old messages
   }
 
   if (needsCaching) {
-    LOG_INFO("Caching update message for ID: ", header.instrumentId,
+    LOG_INFO("Caching update message for id=", header.instrumentId,
              " ChangeNo: ", header.changeNo, " Reason: bookExists=", bookExists,
              " bookIsValid=", bookIsValid,
              " expectedChangeNo=", expectedChangeNo);
 
     if (bookIsValid && header.changeNo != expectedChangeNo) {
-      LOG_WARN("Out-of-sequence update for ID: ", header.instrumentId,
+      LOG_WARN("Out-of-sequence update for id=", header.instrumentId,
                " Received=", header.changeNo, " Expected=", expectedChangeNo,
                ". Invalidating book.");
       ob_it->second.isValid = false; // Invalidate book
@@ -369,7 +336,7 @@ void OrderbookManager::handleUpdateMessage(
 
   // --- Direct Processing Logic ---
   Orderbook &orderbook = ob_it->second;
-  LOG_TRACE("Processing update message directly for ID: ", header.instrumentId,
+  LOG_TRACE("Processing update message directly for id=", header.instrumentId,
             " ChangeNo: ", header.changeNo);
 
   // Store previous VWAP state before applying events
@@ -427,7 +394,7 @@ void OrderbookManager::handleUpdateMessage(
 void OrderbookManager::addPriceLevel(Orderbook &orderbook, Side side,
                                      int priceLevelIndex, double price,
                                      int64_t volume) {
-  LOG_TRACE("Add Level: ID=", orderbook.instrumentId,
+  LOG_TRACE("Add Level: id=", orderbook.instrumentId,
             " Side=", (side == Side::BID ? "BID" : "ASK"),
             " Index=", priceLevelIndex, " Price=", price, " Vol=", volume);
 
@@ -465,7 +432,7 @@ void OrderbookManager::addPriceLevel(Orderbook &orderbook, Side side,
 void OrderbookManager::modifyPriceLevel(Orderbook &orderbook, Side side,
                                         int priceLevelIndex, double price,
                                         int64_t volume) {
-  LOG_TRACE("Modify Level: ID=", orderbook.instrumentId,
+  LOG_TRACE("Modify Level: id=", orderbook.instrumentId,
             " Side=", (side == Side::BID ? "BID" : "ASK"),
             " Index=", priceLevelIndex, " Price=", price, " Vol=", volume);
 
@@ -483,7 +450,7 @@ void OrderbookManager::modifyPriceLevel(Orderbook &orderbook, Side side,
 // Delete a price level
 void OrderbookManager::deletePriceLevel(Orderbook &orderbook, Side side,
                                         int priceLevelIndex) {
-  LOG_TRACE("Delete Level: ID=", orderbook.instrumentId,
+  LOG_TRACE("Delete Level: id=", orderbook.instrumentId,
             " Side=", (side == Side::BID ? "BID" : "ASK"),
             " Index=", priceLevelIndex);
 
@@ -509,7 +476,7 @@ void OrderbookManager::deletePriceLevel(Orderbook &orderbook, Side side,
 // Calculate VWAP for an orderbook
 void OrderbookManager::calculateVWAP(Orderbook &orderbook) {
   if (!orderbook.isValid) {
-    LOG_TRACE("Skipping VWAP calculation for invalid orderbook ID: ",
+    LOG_TRACE("Skipping VWAP calculation for invalid orderbook id=",
               orderbook.instrumentId);
     orderbook.vwapChanged = false;
     return;
@@ -523,7 +490,7 @@ void OrderbookManager::calculateVWAP(Orderbook &orderbook) {
     return;
   }
 
-  LOG_TRACE("Calculating VWAP for ID: ", orderbook.instrumentId);
+  LOG_TRACE("Calculating VWAP for id=", orderbook.instrumentId);
   uint64_t numeratorSum = 0;
   uint64_t denominatorSum = 0;
 
@@ -554,7 +521,7 @@ void OrderbookManager::calculateVWAP(Orderbook &orderbook) {
 
   if (finalNumerator != orderbook.lastVwapNumerator ||
       finalDenominator != orderbook.lastVwapDenominator) {
-    LOG_DEBUG("VWAP changed for ID: ", orderbook.instrumentId,
+    LOG_DEBUG("VWAP changed for id=", orderbook.instrumentId,
               " New: ", finalNumerator, "/", finalDenominator,
               " Old: ", orderbook.lastVwapNumerator, "/",
               orderbook.lastVwapDenominator);
@@ -580,7 +547,7 @@ OrderbookManager::getChangedVWAPs() const {
     const auto &orderbook = pair.second;
     if (orderbook.vwapChanged && orderbook.isValid && orderbook.askCount > 0 &&
         orderbook.bidCount > 0) {
-      LOG_DEBUG("Reporting changed VWAP for ID: ", orderbook.instrumentId,
+      LOG_DEBUG("Reporting changed VWAP for id=", orderbook.instrumentId,
                 " VWAP: ", orderbook.vwapNumerator, "/",
                 orderbook.vwapDenominator);
       results.push_back({orderbook.instrumentId, orderbook.vwapNumerator,
@@ -594,4 +561,48 @@ OrderbookManager::getChangedVWAPs() const {
   }
   LOG_TRACE("Found ", results.size(), " changed VWAPs to report.");
   return results;
+}
+
+void OrderbookManager::clearChangedVWAPs() {
+  for (auto &pair : orderbooks) {
+    pair.second.vwapChanged = false;
+  }
+  LOG_TRACE("Cleared changed VWAP flags.");
+}
+
+void OrderbookManager::loadInstruments(
+    const std::set<std::string> &instruments) {
+  trackedInstruments.clear(); // Clear any previous state
+  trackedInstruments.reserve(
+      instruments.size()); // Optional: Reserve for efficiency
+  for (const auto &instrument : instruments) {
+    trackedInstruments.insert(instrument);
+  }
+  LOG_INFO("OrderbookManager loaded ", trackedInstruments.size(),
+           " instruments for tracking.");
+}
+
+// Update change number from snapshot's trading session info
+void OrderbookManager::updateSnapshotChangeNo(int32_t instrumentId,
+                                              int32_t changeNo) {
+  if (!isTrackedInstrumentId(instrumentId)) {
+    LOG_TRACE("Ignoring change number update for untracked id=", instrumentId);
+    return;
+  }
+  auto it = orderbooks.find(instrumentId);
+  // Check if book exists AND was marked valid by a preceding
+  // processSnapshotInfo call
+  if (it != orderbooks.end() && it->second.isValid) {
+    LOG_DEBUG("Updating snapshot change number for ID ", instrumentId, " from ",
+              it->second.changeNo, " to ", changeNo);
+    it->second.changeNo = changeNo;
+  } else {
+    // This might happen if trading session info comes before instrument info,
+    // which is a protocol violation
+    LOG_WARN(
+        "Attempted to update change number for unknown or invalid snapshot "
+        "id=",
+        instrumentId, ". Book found: ", (it != orderbooks.end()), " IsValid: ",
+        (it != orderbooks.end() ? std::to_string(it->second.isValid) : "N/A"));
+  }
 }

@@ -38,10 +38,20 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 endif()
 
+# Option to enable AddressSanitizer in Debug builds
+option(ENABLE_ASAN "Enable AddressSanitizer for Debug builds" ON)
+
 # Compiler flags
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -fno-omit-frame-pointer")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -fsanitize=address")
+
+# Set base debug flags
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g")
+
+# Conditionally add ASan flags
+if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND ENABLE_ASAN)
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fsanitize=address")
+endif()
 
 # LightPcapNg as a static dependency
 if(USE_LIGHTPCAPNG)
@@ -75,6 +85,7 @@ add_executable(solution
     src/shared_queue.cpp
     src/protocol_parser.cpp
     src/orderbook.cpp
+    src/frame_processor.cpp
 )
 
 # Add compile definition for log level to the main executable

@@ -14,6 +14,8 @@ struct alignas(64) SPSCHeader {
 };
 
 class SharedQueue {
+  friend class FrameProcessor;
+
 public:
   // Constructor for input queue (consumer)
   SharedQueue(const std::string &headerPath, const std::string &bufferPath,

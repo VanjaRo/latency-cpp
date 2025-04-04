@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -72,9 +73,6 @@ class OrderbookManager {
 public:
   OrderbookManager();
 
-  // Load metadata with tracked instruments and IPs
-  void loadMetadata(const std::string &metadataPath);
-
   // Check if an instrument is tracked
   bool isTrackedInstrument(const std::string &name) const;
   bool isTrackedInstrumentId(int32_t id) const;
@@ -90,6 +88,9 @@ public:
   // Finalize the current update and calculate VWAP
   void finalizeSnapshot(int32_t instrumentId);
 
+  // Update change number from snapshot's trading session info
+  void updateSnapshotChangeNo(int32_t instrumentId, int32_t changeNo);
+
   // Process update
   void handleUpdateMessage(const UpdateHeader &header,
                            const std::vector<CachedParsedUpdateEvent> &events);
@@ -101,6 +102,12 @@ public:
     uint32_t denominator;
   };
   std::vector<VWAPResult> getChangedVWAPs() const;
+
+  // Clear the list of changed VWAPs
+  void clearChangedVWAPs();
+
+  // Load target instruments directly
+  void loadInstruments(const std::set<std::string> &instruments);
 
 private:
   // Maps and sets for tracking
