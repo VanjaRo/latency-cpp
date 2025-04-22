@@ -25,6 +25,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, help="Path to the file produced by runner", required=True)
     parser.add_argument("--correct", type=str, help="Path to the file with a correct answer")
     parser.add_argument("--tsc", type=int, help="Rate of TSC if you want to convert ticks to the elapsed time")
+    parser.add_argument("--check-only", type=int, help="Don't calc score, just check results", default=0)
     args = parser.parse_args()
 
     lat_data, output = read_output(args.output)
@@ -33,6 +34,8 @@ if __name__ == "__main__":
         if output != correct_output:
             print("Files with results are different", file=sys.stderr)
             sys.exit(1)
+        if args.check_only:
+            sys.exit(0)
     score, lat_values = calc_score(lat_data)
     print("{:.3f}".format(score))
     print("Measured on {} values".format(len(lat_data)), file=sys.stderr)
