@@ -1,16 +1,13 @@
 #!/bin/bash
-# Local build script for the latency solution
 # Usage: ./build.sh [--with-lightpcapng | --no-lightpcapng] [--log-level <LEVEL>] [--build-type <TYPE>] [--enable-asan | --disable-asan]
 
 set -euo pipefail
 
-# Default values
-USE_LIGHTPCAPNG=ON
-LOG_LEVEL="NONE" # Default log level
-BUILD_TYPE="Debug" # Default build type
-ENABLE_ASAN="ON" # Default ASan state
+USE_LIGHTPCAPNG=OFF
+LOG_LEVEL="NONE"
+BUILD_TYPE="Debug"
+ENABLE_ASAN="ON"
 
-# --- Argument Parsing ---
 VALID_LOG_LEVELS=("NONE" "ERROR" "WARN" "INFO" "DEBUG" "TRACE")
 VALID_BUILD_TYPES=("Debug" "Release")
 
@@ -18,20 +15,20 @@ function is_valid_log_level() {
   local level="$1"
   for valid_level in "${VALID_LOG_LEVELS[@]}"; do
     if [[ "$level" == "$valid_level" ]]; then
-      return 0 # Valid
+      return 0
     fi
   done
-  return 1 # Invalid
+  return 1
 }
 
 function is_valid_build_type() {
   local type="$1"
   for valid_type in "${VALID_BUILD_TYPES[@]}"; do
     if [[ "$type" == "$valid_type" ]]; then
-      return 0 # Valid
+      return 0
     fi
   done
-  return 1 # Invalid
+  return 1
 }
 
 while [[ $# -gt 0 ]]; do
@@ -55,7 +52,6 @@ while [[ $# -gt 0 ]]; do
           fi
       else
         echo "Error: --log-level requires an argument."
-        echo "Usage: $0 [--with-lightpcapng | --no-lightpcapng] [--log-level <LEVEL>] [--build-type <TYPE>] [--enable-asan | --disable-asan]"
         exit 1
       fi
       ;;
@@ -70,7 +66,6 @@ while [[ $# -gt 0 ]]; do
           fi
       else
         echo "Error: --build-type requires an argument."
-        echo "Usage: $0 [--with-lightpcapng | --no-lightpcapng] [--log-level <LEVEL>] [--build-type <TYPE>] [--enable-asan | --disable-asan]"
         exit 1
       fi
       ;;
@@ -90,36 +85,24 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# --- Check for ccache ---
-CMAKE_PREFIX_CMD=""
-# --- Local Build ---
-echo "=== Building solution locally ==="
 SOLUTION_DIR="$(pwd)/solution"
-BUILD_DIR="${SOLUTION_DIR}/build_${BUILD_TYPE,,}" # Create separate build dirs for Debug/Release
+BUILD_DIR="${SOLUTION_DIR}/build_${BUILD_TYPE,,}"
 BIN_DIR="${BUILD_DIR}/bin"
 
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
-echo "--- Running CMake ---"
-# Pass the absolute path to the source directory to CMake
-# Use ccache if available
-${CMAKE_PREFIX_CMD} cmake "${SOLUTION_DIR}" \
+cmake "${SOLUTION_DIR}" \
     -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
     -DUSE_LIGHTPCAPNG=${USE_LIGHTPCAPNG} \
     -DCMAKE_LOG_LEVEL=${LOG_LEVEL} \
     -DENABLE_ASAN=${ENABLE_ASAN}
 
-echo "--- Building with Make ---"
-# Use nproc if available, otherwise default to 1 core
 NPROC=$(nproc 2>/dev/null || echo 1)
-# Use ccache if available
-${CMAKE_PREFIX_CMD} make -j${NPROC}
+make -j${NPROC}
 
-# Binaries are placed in ${BIN_DIR} by CMake install rule
 echo "--- Binaries located in ${BIN_DIR} ---"
-
-cd ../.. # Return to the root directory
+cd ../..
 
 echo "=== Local build completed successfully! ==="
 if [ "${USE_LIGHTPCAPNG}" = "ON" ]; then

@@ -17,6 +17,9 @@ class SharedQueue {
   friend class FrameProcessor;
 
 public:
+  // Align bytes to 8-byte boundary (made public and static)
+  static uint32_t align8(uint32_t bytes) { return (bytes + 7) & ~7; }
+
   // Constructor for input queue (consumer)
   SharedQueue(const std::string &headerPath, const std::string &bufferPath,
               size_t bufferSize, bool isProducer);
@@ -47,18 +50,13 @@ private:
   size_t bufferSize;
   bool isProducer;
 
-  // Align bytes to 8-byte boundary
-  uint32_t align8(uint32_t bytes) const { return (bytes + 7) & ~7; }
-
-  // Get read position in the buffer
   uint32_t getReadPos() const {
-    return header->consumer_offset.load(std::memory_order_relaxed) &
+    return header->consumer_offset.load(std::memory_order_acquire) &
            (bufferSize - 1);
   }
 
-  // Get write position in the buffer
   uint32_t getWritePos() const {
-    return header->producer_offset.load(std::memory_order_relaxed) &
+    return header->producer_offset.load(std::memory_order_acquire) &
            (bufferSize - 1);
   }
 };

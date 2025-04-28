@@ -7,7 +7,13 @@ RUN apt-get update && apt-get install -y \
     g++-13 \
     clang-18 \
     git \
-    && rm -rf /var/lib/apt/lists/*
+    gdb \
+    gdbserver \
+    lldb \
+    strace 
+
+# Expose the port gdbserver will listen on
+EXPOSE 1234
 
 COPY runner /app/runner
 # Copy GDB over if only installed in builder and needed here

@@ -42,6 +42,9 @@ docker run -itd \
     --name ${CONTAINER_NAME} \
     --ipc=host \
     --ulimit memlock=-1 \
+    --cap-add=SYS_PTRACE \
+    --security-opt seccomp=unconfined \
+    -p 1234:1234 \
     -v "$(pwd)/solution:/app/solution" \
     -v "$(pwd)/lat-spring-data:/app/lat-spring-data" \
     -v "$(pwd)/results:/app/results" \

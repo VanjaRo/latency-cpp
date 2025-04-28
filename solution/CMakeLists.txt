@@ -1,9 +1,8 @@
 cmake_minimum_required(VERSION 3.14)
 project(latency_solution CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Options
 option(USE_LIGHTPCAPNG "Use LightPcapNg library instead of custom implementation" OFF)
@@ -81,45 +80,52 @@ endif()
 # Main executable
 add_executable(solution
     src/main.cpp
-    src/pcap_reader.cpp
     src/shared_queue.cpp
     src/protocol_parser.cpp
     src/orderbook.cpp
     src/frame_processor.cpp
 )
 
+# Conditionally add pcap_reader.cpp only if USE_LIGHTPCAPNG is ON
+if(USE_LIGHTPCAPNG)
+    target_sources(solution PRIVATE src/pcap_reader.cpp)
+endif()
+
 # Add compile definition for log level to the main executable
 target_compile_definitions(solution PRIVATE COMPILE_TIME_LOG_LEVEL=${LOG_LEVEL_INT})
 
-# PCAP dumper tool for debugging
-add_executable(pcap_dumper
-    src/pcap_dumper.cpp
-    src/pcap_reader.cpp
-    src/protocol_parser.cpp
-    src/orderbook.cpp
-)
+# PCAP dumper tool for debugging - REMOVED
+# add_executable(pcap_dumper
+# src/pcap_dumper.cpp
+# src/pcap_reader.cpp
+# src/protocol_parser.cpp
+# src/orderbook.cpp
+# )
 
-# Add compile definition for log level to the pcap_dumper tool as well
-target_compile_definitions(pcap_dumper PRIVATE COMPILE_TIME_LOG_LEVEL=${LOG_LEVEL_INT})
-
+# Add compile definition for log level to the pcap_dumper tool as well - REMOVED
+# target_compile_definitions(pcap_dumper PRIVATE COMPILE_TIME_LOG_LEVEL=${LOG_LEVEL_INT})
 target_include_directories(solution PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_include_directories(pcap_dumper PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# target_include_directories(pcap_dumper PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src) # REMOVED
 
 # Link necessary libraries
 target_link_libraries(solution PRIVATE pthread)
-target_link_libraries(pcap_dumper PRIVATE pthread)
 
+# target_link_libraries(pcap_dumper PRIVATE pthread) # REMOVED
 if(USE_LIGHTPCAPNG)
     # Include LightPcapNg headers
     target_include_directories(solution PRIVATE ${LIGHTPCAPNG_SRC_DIR}/include)
-    target_include_directories(pcap_dumper PRIVATE ${LIGHTPCAPNG_SRC_DIR}/include)
+
+    # target_include_directories(pcap_dumper PRIVATE ${LIGHTPCAPNG_SRC_DIR}/include) # REMOVED
 
     # Link with LightPcapNg
     target_link_libraries(solution PRIVATE light_pcapng)
-    target_link_libraries(pcap_dumper PRIVATE light_pcapng)
+
+    # target_link_libraries(pcap_dumper PRIVATE light_pcapng) # REMOVED
 endif()
 
 # Install rules
 # Install binaries to a standard location within the build environment
 install(TARGETS solution DESTINATION bin)
-install(TARGETS pcap_dumper DESTINATION bin)
+
+# install(TARGETS pcap_dumper DESTINATION bin) # REMOVED

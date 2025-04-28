@@ -90,7 +90,7 @@ SharedQueue::~SharedQueue() {
   munmap(header, sizeof(SPSCHeader));
   // The two mappings share the same underlying anonymous region started at
   // 'buffer'. Unmapping the entire region is sufficient.
-  if (buffer != nullptr) { // Check buffer is not null before unmapping
+  if (buffer != nullptr) {
     munmap(buffer, bufferSize * 2);
   }
   close(headerFd);
@@ -103,15 +103,16 @@ bool SharedQueue::canRead(size_t bytes) const {
 
 const uint8_t *SharedQueue::getReadPtr() const { return buffer + getReadPos(); }
 
+// Accepts bytes aligned to 8-byte boundary
 void SharedQueue::advanceConsumer(uint32_t bytes) {
-  bytes = align8(bytes);
+  // bytes = SharedQueue::align8(bytes);
   std::atomic_fetch_add_explicit(&header->consumer_offset, bytes,
                                  std::memory_order_release);
 }
 
 size_t SharedQueue::getReadableBytes() const {
   uint32_t producer = header->producer_offset.load(std::memory_order_acquire);
-  uint32_t consumer = header->consumer_offset.load(std::memory_order_relaxed);
+  uint32_t consumer = header->consumer_offset.load(std::memory_order_acquire);
   return producer - consumer;
 }
 
@@ -121,14 +122,15 @@ bool SharedQueue::canWrite(size_t bytes) const {
 
 uint8_t *SharedQueue::getWritePtr() { return buffer + getWritePos(); }
 
+// Accepts bytes aligned to 8-byte boundary
 void SharedQueue::advanceProducer(uint32_t bytes) {
-  bytes = align8(bytes);
+  // bytes = SharedQueue::align8(bytes);
   std::atomic_fetch_add_explicit(&header->producer_offset, bytes,
                                  std::memory_order_release);
 }
 
 size_t SharedQueue::getWritableBytes() const {
-  uint32_t producer = header->producer_offset.load(std::memory_order_relaxed);
+  uint32_t producer = header->producer_offset.load(std::memory_order_acquire);
   uint32_t consumer = header->consumer_offset.load(std::memory_order_acquire);
   return bufferSize - (producer - consumer);
 }

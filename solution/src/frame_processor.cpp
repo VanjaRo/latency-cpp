@@ -1,6 +1,7 @@
 #include "frame_processor.h"
 #include "pcap_reader.h" // For header structs and ipStringToUint32 declaration
 #include "protocol_logger.h"
+#include "shared_queue.h" // Make sure SharedQueue is included
 
 #include <arpa/inet.h> // For ntohs, ntohl, inet_pton
 #include <chrono>
@@ -155,54 +156,37 @@ bool FrameProcessor::waitForBytes(size_t requiredBytes, uint64_t frameCounter,
   int wait_count = 0;
   const int max_wait_cycles = 10000000; // ~100 seconds timeout with 10us sleep
   const int log_interval = 100000;      // Log every second or so
-  bool overflow_warning_logged = false; // Track if we logged the warning
+  // bool overflow_warning_logged = false; // Track if we logged the warning //
+  // Removed
 
   while (true) { // Loop until we break due to success or failure
+    // Get readable bytes using uint32_t subtraction (handles wrap-around)
     readableBytes = inputQueue_->getReadableBytes();
 
-    // --- Check 1: Are we in an overflow/wrap-around state? ---
-    // If readableBytes >= bufferSize, producer has lapped consumer.
-    // Instead of failing, we wait for the consumer to advance, normalizing the
-    // count.
-    if (readableBytes >= inputQueue_->getBufferSize()) {
-      if (!overflow_warning_logged || wait_count % log_interval == 0) {
-        LOG_WARN( // Log periodically if stuck here
-            "[Frame ", frameCounter, "] [", waitReason,
-            " WAIT] Waiting on potential buffer overflow state! Readable bytes "
-            "(",
-            readableBytes, ") >= BufferSize (", inputQueue_->getBufferSize(),
-            "). Waiting for consumer to advance...");
-        overflow_warning_logged = true;
-      }
-      // --- Key Change: Do NOT return false here. Continue to timeout check /
-      // wait logic. ---
-    }
-    // --- Check 2: If NOT in overflow state, do we have enough bytes? ---
-    // This is the only success condition: enough data AND not in the overflow
-    // state.
-    else if (readableBytes >= requiredBytes) {
+    // --- Check 1: Do we have enough bytes? ---
+    // This is the only check needed for availability.
+    // The uint32_t subtraction in getReadableBytes correctly handles
+    // wrap-around.
+    if (readableBytes >= requiredBytes) {
       break; // Exit the while loop, success!
     }
 
-    // --- Check 3: Timeout ---
-    // Check timeout regardless of overflow state, as we might be stuck waiting
-    // for normalization.
+    // --- Check 2: Timeout ---
     if (wait_count >= max_wait_cycles) {
+      // Log the state at timeout
+      uint32_t current_producer =
+          inputQueue_->header->producer_offset.load(std::memory_order_relaxed);
+      uint32_t current_consumer =
+          inputQueue_->header->consumer_offset.load(std::memory_order_relaxed);
       LOG_ERROR("[Frame ", frameCounter, "] [", waitReason,
                 " WAIT TIMEOUT] Stuck waiting for ", requiredBytes,
-                " bytes. Have ", readableBytes,
-                (overflow_warning_logged ? " (likely in overflow state)"
-                                         : ""), // Add context
-                ". Aborting wait.");
+                " bytes. Have ", readableBytes, " (Prod: ", current_producer,
+                ", Cons: ", current_consumer, "). Aborting wait.");
       return false; // Indicate timeout/failure
     }
 
     // --- Wait Logic ---
-    // Only log the generic "waiting" debug message if we haven't logged the
-    // specific overflow warning to avoid log spam when waiting in the overflow
-    // state.
-    if (!overflow_warning_logged &&
-        (wait_count == 0 || wait_count % log_interval == 0)) {
+    if (wait_count == 0 || wait_count % log_interval == 0) {
       uint32_t current_producer =
           inputQueue_->header->producer_offset.load(std::memory_order_relaxed);
       uint32_t current_consumer =
@@ -218,10 +202,15 @@ bool FrameProcessor::waitForBytes(size_t requiredBytes, uint64_t frameCounter,
   } // --- End while(true) ---
 
   // If we exited the loop, it means success condition was met.
+  uint32_t final_producer =
+      inputQueue_->header->producer_offset.load(std::memory_order_relaxed);
+  uint32_t final_consumer =
+      inputQueue_->header->consumer_offset.load(std::memory_order_relaxed);
   LOG_TRACE("[Frame ", frameCounter, "] [", waitReason,
             " WAIT] Acquired required ", requiredBytes, " bytes (have ",
-            readableBytes, ")."); // Log the final readableBytes value checked
-  return true;                    // Success
+            readableBytes, ", Prod: ", final_producer,
+            ", Cons: ", final_consumer, ").");
+  return true; // Success
 }
 
 // Helper function to parse the next packet from the input queue
@@ -340,41 +329,35 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
         "[Frame " + std::to_string(frameCounter) +
         "] Exception accessing IP Header fields: " + e.what());
   } catch (...) {
-    // --- MODIFIED: Throw instead of abort ---
     throw std::runtime_error("[Frame " + std::to_string(frameCounter) +
                              "] FATAL: Unknown exception accessing IP Header "
                              "fields. Corrupted buffer?");
-    // abort(); // Original call removed
   }
 
   // 6. Calculate required frame size and wait for it
   info.frameSize =
       sizeof(EthernetHeader) + info.ipTotalLength + ETHERNET_FCS_LENGTH;
-  info.alignedFrameSize = (info.frameSize + 7) & ~7;
+  info.alignedFrameSize = SharedQueue::align8(info.frameSize);
   LOG_TRACE("[Frame ", frameCounter, "] Calculated frameSize=", info.frameSize,
             ", alignedFrameSize=", info.alignedFrameSize);
 
   if (!waitForBytes(info.frameSize, frameCounter, "FRAME_DATA")) {
-    // --- MODIFIED: Throw instead of abort ---
+
     throw std::runtime_error(
         "[Frame " + std::to_string(frameCounter) +
         "] waitForBytes failed (likely input queue overrun/lapping/timeout) "
         "while waiting for FRAME_DATA (" +
         std::to_string(info.frameSize) + " bytes).");
-    // abort(); // Original call removed
   }
   info.bytesAvailableWhenParsed = inputQueue_->getReadableBytes();
 
   // 7. Re-get pointers and extract UDP info (if applicable)
   info.rawDataStart = inputQueue_->getReadPtr();
   if (!info.rawDataStart) {
-    // --- MODIFIED: Throw instead of abort ---
     throw std::runtime_error(
         "[Frame " + std::to_string(frameCounter) +
         "] FATAL: getReadPtr() null after frame data wait!");
-    // abort(); // Original call removed
   }
-  // No need to re-read IP fields already stored in info
 
   // 8. Filter by Source IP and Protocol
   info.isSnapshot = (info.sourceIP == snapshotIP_);
@@ -455,10 +438,9 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
       }
     }
   } catch (...) {
-    LOG_ERROR(
-        "[Frame ", frameCounter,
+    throw std::runtime_error(
+        "[Frame " + std::to_string(frameCounter) +
         "] FATAL: Exception accessing UDP Header/Payload. Corrupted buffer?");
-    abort();
   }
 
   // If we reached here and it's a snapshot or update UDP packet, mark as valid
@@ -491,7 +473,7 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
       wait_cycles++;
       std::this_thread::sleep_for(std::chrono::microseconds(5));
     }
-    LOG_TRACE("[Frame ", frameCounter,
+    LOG_DEBUG("[Frame ", frameCounter,
               "] Output queue has space for 0. Writing...");
     uint32_t *writePtr =
         reinterpret_cast<uint32_t *>(outputQueue_->getWritePtr());
@@ -520,7 +502,7 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
         wait_cycles++;
         std::this_thread::sleep_for(std::chrono::microseconds(5));
       }
-      LOG_TRACE("[Frame ", frameCounter,
+      LOG_DEBUG("[Frame ", frameCounter,
                 "] Output queue has space for 0 (no change). Writing...");
       uint32_t *writePtr =
           reinterpret_cast<uint32_t *>(outputQueue_->getWritePtr());
@@ -618,8 +600,7 @@ void FrameProcessor::advanceInputQueue(const PacketInfo &packetInfo,
     LOG_WARN("[Frame ", frameCounter,
              "] Packet resulted in 0 alignedFrameSize (Likely non-IP or "
              "invalid header). Advancing by minimum 8 bytes.");
-    inputQueue_->advanceConsumer(
-        8); // Fallback advance for non-IP/invalid frames
+    inputQueue_->advanceConsumer(SharedQueue::align8(8));
   }
 }
 
@@ -658,9 +639,8 @@ void FrameProcessor::processSingleFrame(uint64_t frameCounter) {
 void FrameProcessor::runQueue() {
   LOG_INFO("Starting frame processing loop (Queue mode).");
   if (!inputQueue_ || !outputQueue_) {
-    // Keep abort here - fundamental setup error before loop starts.
-    LOG_ERROR("FATAL: Input or Output queue is NULL in runQueue! Aborting.");
-    abort();
+    throw std::runtime_error(
+        "FATAL: Input or Output queue is NULL in runQueue!");
   }
 
   uint64_t frameCounter = 1; // Initialize frame counter
