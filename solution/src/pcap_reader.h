@@ -41,6 +41,7 @@ struct UDPHeader {
 using FrameCallback =
     std::function<void(const uint8_t *, size_t, uint32_t, uint32_t)>;
 
+// Unconditionally declare PcapReader
 class PcapReader {
 public:
   explicit PcapReader(const std::string &filename);

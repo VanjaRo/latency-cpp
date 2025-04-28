@@ -24,6 +24,19 @@ int main(int argc, char *argv[]) {
       // PCAP Debug Mode
       std::string pcapFilename = argv[1];
       std::string metadataPath = argv[2];
+
+      // Check if LightPcapNg support is enabled
+#if USE_LIGHTPCAPNG != 1
+      LOG_ERROR(
+          "PCAP mode is not available because USE_LIGHTPCAPNG is not enabled.");
+      LOG_ERROR("Please rebuild with ./build.sh --with-lightpcapng to enable "
+                "PCAP support.");
+      std::cerr << "Error: PCAP mode requires LightPcapNg support. Rebuild "
+                   "with --with-lightpcapng."
+                << std::endl;
+      return 1;
+#endif
+
       LOG_INFO("Running in PCAP mode.");
       LOG_INFO("PCAP File: ", pcapFilename);
       LOG_INFO("Metadata Path: ", metadataPath);

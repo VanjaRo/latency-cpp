@@ -1,7 +1,6 @@
 #pragma once
 
 #include "orderbook.h"
-#include "pcap_reader.h"
 #include "protocol_parser.h"
 #include "shared_queue.h"
 #include <cstdint>
@@ -9,11 +8,74 @@
 #include <set>
 #include <string>
 
-// Forward declare header structs if not already included via pcap_reader.h
-// (Good practice if pcap_reader.h isn't strictly necessary for this header)
-struct EthernetHeader;
-struct IPv4Header;
-struct UDPHeader;
+// Always forward declare ipStringToUint32 to ensure it's available regardless
+// of USE_LIGHTPCAPNG
+uint32_t ipStringToUint32(const std::string &ipStr);
+
+// Define header structures and PcapReader based on whether LightPcapNg is
+// enabled
+#if USE_LIGHTPCAPNG == 1
+// When LightPcapNg is enabled, include pcap_reader.h
+#include "pcap_reader.h"
+#else
+// When LightPcapNg is disabled, define our own structures and a stub PcapReader
+#include <functional>
+#include <stdexcept>
+
+// Network header structures
+#pragma pack(push, 1)
+struct EthernetHeader {
+  uint8_t destMac[6];
+  uint8_t srcMac[6];
+  uint16_t etherType;
+};
+
+struct IPv4Header {
+  uint8_t versionAndIHL;
+  uint8_t typeOfService;
+  uint16_t totalLength;
+  uint16_t identification;
+  uint16_t flagsAndFragmentOffset;
+  uint8_t ttl;
+  uint8_t protocol;
+  uint16_t headerChecksum;
+  uint32_t sourceIP;
+  uint32_t destIP;
+};
+
+struct UDPHeader {
+  uint16_t sourcePort;
+  uint16_t destPort;
+  uint16_t length;
+  uint16_t checksum;
+};
+#pragma pack(pop)
+
+// Define FrameCallback type to match the one in pcap_reader.h
+using FrameCallback =
+    std::function<void(const uint8_t *, size_t, uint32_t, uint32_t)>;
+
+// Stub implementation of PcapReader
+class PcapReader {
+public:
+  explicit PcapReader(const std::string &filename) {
+    throw std::runtime_error(
+        "PcapReader is disabled because USE_LIGHTPCAPNG is not enabled");
+  }
+  ~PcapReader() = default;
+
+  void processAllFrames(const FrameCallback &callback) {
+    throw std::runtime_error(
+        "PcapReader is disabled because USE_LIGHTPCAPNG is not enabled");
+  }
+
+  void processFilteredFrames(uint32_t sourceIP, uint32_t destIP,
+                             const FrameCallback &callback) {
+    throw std::runtime_error(
+        "PcapReader is disabled because USE_LIGHTPCAPNG is not enabled");
+  }
+};
+#endif // End of USE_LIGHTPCAPNG != 1 block
 
 class FrameProcessor {
 public:

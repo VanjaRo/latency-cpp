@@ -53,7 +53,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND ENABLE_ASAN)
 endif()
 
 # LightPcapNg as a static dependency
-if(USE_LIGHTPCAPNG)
+if(USE_LIGHTPCAPNG STREQUAL "ON")
     # Set paths for the static library
     set(LIGHTPCAPNG_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/LightPcapNg")
 
@@ -71,10 +71,12 @@ if(USE_LIGHTPCAPNG)
         add_subdirectory(${LIGHTPCAPNG_SRC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/lightpcapng)
 
         # Define preprocessor macro to use LightPcapNg
-        add_compile_definitions(USE_LIGHTPCAPNG)
+        add_compile_definitions(USE_LIGHTPCAPNG=1)
     else()
         message(FATAL_ERROR "LightPcapNg source directory not found at ${LIGHTPCAPNG_SRC_DIR}. Please ensure the LightPcapNg library is in the lib/LightPcapNg directory.")
     endif()
+else()
+    add_compile_definitions(USE_LIGHTPCAPNG=0)
 endif()
 
 # Main executable
@@ -86,8 +88,8 @@ add_executable(solution
     src/frame_processor.cpp
 )
 
-# Conditionally add pcap_reader.cpp only if USE_LIGHTPCAPNG is ON
-if(USE_LIGHTPCAPNG)
+# Conditionally add pcap_reader.cpp only if USE_LIGHTPCAPNG is explicitly ON (equals "ON")
+if(USE_LIGHTPCAPNG STREQUAL "ON")
     target_sources(solution PRIVATE src/pcap_reader.cpp)
 endif()
 
@@ -112,7 +114,7 @@ target_include_directories(solution PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(solution PRIVATE pthread)
 
 # target_link_libraries(pcap_dumper PRIVATE pthread) # REMOVED
-if(USE_LIGHTPCAPNG)
+if(USE_LIGHTPCAPNG STREQUAL "ON")
     # Include LightPcapNg headers
     target_include_directories(solution PRIVATE ${LIGHTPCAPNG_SRC_DIR}/include)
 

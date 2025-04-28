@@ -1,7 +1,5 @@
 #include "frame_processor.h"
-#include "pcap_reader.h" // For header structs and ipStringToUint32 declaration
 #include "protocol_logger.h"
-#include "shared_queue.h" // Make sure SharedQueue is included
 
 #include <arpa/inet.h> // For ntohs, ntohl, inet_pton
 #include <chrono>
@@ -11,6 +9,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+
+// The global ipStringToUint32 function is now always defined in pcap_reader.cpp
 
 // Helper function to convert IP string to uint32_t (Network Byte Order)
 uint32_t FrameProcessor::ipStringToUint32(const std::string &ip_str) {
@@ -102,6 +102,7 @@ void FrameProcessor::run() {
 
 void FrameProcessor::runPcap() {
   LOG_INFO("Running in PCAP mode from file: ", pcapFilename_);
+#if USE_LIGHTPCAPNG == 1
   try {
     pcapReader_ = std::make_unique<PcapReader>(pcapFilename_);
 
@@ -109,44 +110,37 @@ void FrameProcessor::runPcap() {
     pcapReader_->processFilteredFrames(
         snapshotIP_, updateIP_,
         [&](const uint8_t *data, size_t size, uint32_t srcIPNBO,
-            uint32_t dstIPNBO) { // Keep IPs in Network Byte Order for check
-          bool isSnapshot = (srcIPNBO == snapshotIP_); // Compare NBO directly
-          try {
-            // Parse the payload - parser calls appropriate OB methods
-            if (size > 0) {
-              protocolParser_.parsePayload(data, size);
-            } else {
-              LOG_WARN("PCAP: Received zero-length payload.");
-            }
-          } catch (const std::exception &e) {
-            LOG_ERROR("PCAP: Error parsing payload: ", e.what());
-            // Decide if we should skip or stop?
-            // Let's log and continue for now.
+            uint32_t dstIPNBO) {
+          // Skip tiny payloads (likely heartbeats, etc.)
+          if (size < 10) {
+            LOG_DEBUG("Skipping small packet of size ", size);
+            return;
           }
 
-          // Check for changed VWAPs AFTER parsing an UPDATE payload
-          if (!isSnapshot) {
-            auto changedVWAPs = orderbookManager_.getChangedVWAPs();
+          const bool isSnapshot = (srcIPNBO == snapshotIP_);
+          LOG_DEBUG("Processing ", (isSnapshot ? "snapshot" : "update"),
+                    " packet of size ", size);
 
-            // Print changed VWAPs for debugging
-            if (!changedVWAPs.empty()) {
-              LOG_DEBUG("PCAP: VWAP changes: ", changedVWAPs.size());
-              // Optional: Loop and log individual VWAPs if needed for verbose
-              // debug for (const auto &vwap : changedVWAPs) {
-              //   LOG_DEBUG("  InstrumentID: ", vwap.instrumentId, ", VWAP: ",
-              //   vwap.numerator, "/", vwap.denominator);
-              // }
-              orderbookManager_.clearChangedVWAPs(); // Clear after processing
-            }
-          }
-          // No output needed for snapshot frames in debug mode either
+          // Process the payload based on the packet type
+          protocolParser_.parsePayload(data, size);
         });
-    LOG_INFO("Finished processing PCAP file.");
+  } catch (const std::runtime_error &e) {
+    // Handle PcapReader-specific errors
+    LOG_ERROR("PcapReader error: ", e.what());
+    throw; // Re-throw to let main handle it
   } catch (const std::exception &e) {
-    LOG_ERROR("Error during PCAP processing: ", e.what());
-    // Decide if we should re-throw or handle differently
-    throw; // Re-throw for main to catch
+    LOG_ERROR("Unexpected error during PCAP processing: ", e.what());
+    throw;
   }
+#else
+  // When LightPcapNg support is disabled, provide a clear error message
+  LOG_ERROR(
+      "PCAP mode is not available because USE_LIGHTPCAPNG is not enabled.");
+  LOG_ERROR("Please rebuild with ./build.sh --with-lightpcapng to enable PCAP "
+            "support.");
+  throw std::runtime_error("PCAP mode requires LightPcapNg support. Rebuild "
+                           "with --with-lightpcapng.");
+#endif
 }
 
 // Helper function to wait for a minimum number of bytes in the queue
