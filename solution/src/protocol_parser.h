@@ -123,7 +123,10 @@ public:
   }
 
   // Parse a frame and call manager methods directly
-  void parsePayload(const uint8_t *data, size_t size); // Removed callbacks
+  void parsePayload(const uint8_t *data, size_t size);
+
+  // Detect message type from header without processing the full payload
+  static MessageType detectMessageType(const uint8_t *data, size_t size);
 
   // Helper to decode vint (variable length integer)
   static int64_t decodeVInt(const uint8_t *data, size_t &offset,

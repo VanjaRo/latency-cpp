@@ -130,6 +130,8 @@ void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
 
     const uint8_t *messageData = data + current_offset + sizeof(FrameHeader);
     size_t messageSize = header->length;
+
+    // Get message type from the header
     MessageType msgType = static_cast<MessageType>(header->typeId);
 
     LOG_DEBUG("Processing message type=", std::hex, static_cast<int>(msgType),
@@ -713,4 +715,26 @@ const T *ProtocolParser::getFieldPtr(const uint8_t *data, size_t offset,
                              std::to_string(size));
   }
   return reinterpret_cast<const T *>(data + offset);
+}
+
+// Detect message type from header without processing the full payload
+MessageType ProtocolParser::detectMessageType(const uint8_t *data,
+                                              size_t size) {
+  if (!data || size < sizeof(FrameHeader)) {
+    LOG_TRACE("Cannot detect message type: data is null or size is too small");
+    return MessageType::UNKNOWN;
+  }
+
+  const FrameHeader *frameHeader = reinterpret_cast<const FrameHeader *>(data);
+  uint8_t typeId = frameHeader->typeId;
+
+  if (typeId == static_cast<uint8_t>(MessageType::SNAPSHOT)) {
+    return MessageType::SNAPSHOT;
+  } else if (typeId == static_cast<uint8_t>(MessageType::UPDATE)) {
+    return MessageType::UPDATE;
+  } else {
+    LOG_TRACE("Unknown message type ID: 0x", std::hex, static_cast<int>(typeId),
+              std::dec);
+    return MessageType::UNKNOWN;
+  }
 }

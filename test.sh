@@ -61,7 +61,7 @@ run_shm_test() {
   local meta_path="${DATA_DIR}/${file}.meta"
   local runner_log_path="${RESULTS_DIR}/${file}_runner.log"
   local runner_another_log_path="${RESULTS_DIR}/${file}_runner_another.log"
-  local runner_bin="/app/runner"
+  local runner_bin="./runner"
 
   if [ ! -x "${runner_bin}" ]; then
       echo "Error: Runner binary not found or not executable at ${runner_bin}"

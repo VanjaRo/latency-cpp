@@ -106,9 +106,8 @@ private:
     uint8_t ipHeaderLength = 0; // In bytes
     uint16_t ipTotalLength = 0; // In bytes
     uint8_t ipProtocol = 0;
-    uint32_t sourceIP = 0; // Network byte order
-    bool isSnapshot = false;
-    bool isUpdate = false;
+    uint32_t sourceIP = 0;   // Network byte order
+    bool isTargetIP = false; // Whether this is from one of our target IPs
     size_t frameSize = 0; // Actual size based on IP totalLength + headers + FCS
     size_t alignedFrameSize = 0; // Frame size rounded up to 8-byte alignment
     size_t bytesAvailableWhenParsed = 0; // Debug/diagnostic info
@@ -129,8 +128,8 @@ private:
   std::string metadataPath_;
   OrderbookManager orderbookManager_;
   ProtocolParser protocolParser_;
-  uint32_t snapshotIP_ = 0;
-  uint32_t updateIP_ = 0;
+  uint32_t snapshotIP_ = 0; // Used for filtering packets
+  uint32_t updateIP_ = 0;   // Used for filtering packets
   std::set<std::string> targetInstruments_;
 
   // Helper function to load metadata (IPs and instruments)
@@ -142,15 +141,15 @@ private:
   // Runs the processing loop for Queue input (existing logic)
   void runQueue();
 
-  // Helper to parse the next packet from the input queue
+  // Network-level packet parsing
   PacketInfo parseNextPacket(uint64_t frameCounter);
 
-  // Helper function to process a single frame from the input queue
-  void processSingleFrame(uint64_t frameCounter);
+  // Process a valid packet's payload by sending to protocol parser
+  bool processPacketPayload(const PacketInfo &packetInfo,
+                            uint64_t frameCounter);
 
-  // Helper function to process the payload of a valid packet
-  // Returns true if a processing error occurred, false otherwise.
-  bool processPayload(const PacketInfo &packetInfo, uint64_t frameCounter);
+  // Process a single frame from the input queue (main processing function)
+  void processSingleFrame(uint64_t frameCounter);
 
   // Helper function to advance the input queue consumer
   void advanceInputQueue(const PacketInfo &packetInfo, uint64_t frameCounter);

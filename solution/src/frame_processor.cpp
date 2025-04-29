@@ -43,6 +43,8 @@ bool FrameProcessor::loadMetadata() {
         snapshotIP_ = ipStringToUint32(ip1_str);
         updateIP_ = ipStringToUint32(ip2_str);
         LOG_INFO("Target IPs loaded: Snapshot=", ip1_str, ", Update=", ip2_str);
+        LOG_INFO("Note: IP-based message type detection is now deprecated, "
+                 "using message header instead");
       } catch (const std::runtime_error &e) {
         LOG_ERROR("Failed to parse IPs from metadata: ", e.what());
         return false;
@@ -117,12 +119,47 @@ void FrameProcessor::runPcap() {
             return;
           }
 
-          const bool isSnapshot = (srcIPNBO == snapshotIP_);
-          LOG_DEBUG("Processing ", (isSnapshot ? "snapshot" : "update"),
-                    " packet of size ", size);
+          // Check if this is from one of our target IPs
+          const bool fromTargetIP =
+              (srcIPNBO == snapshotIP_ || srcIPNBO == updateIP_);
 
-          // Process the payload based on the packet type
-          protocolParser_.parsePayload(data, size);
+          if (!fromTargetIP) {
+            LOG_DEBUG("Skipping packet from non-target IP");
+            return;
+          }
+
+          LOG_DEBUG("Processing packet of size ", size, " from target IP");
+
+          // Determine message type
+          bool isSnapshotOrError = true; // Default to true (write 0)
+
+          try {
+            // Detect message type to determine output behavior
+            if (size >= sizeof(FrameHeader)) {
+              MessageType msgType =
+                  ProtocolParser::detectMessageType(data, size);
+              // Only set to false if it's definitely an UPDATE message
+              if (msgType == MessageType::UPDATE) {
+                isSnapshotOrError = false;
+              }
+            }
+
+            // Process the payload
+            protocolParser_.parsePayload(data, size);
+
+            // Even after successful parsing, we still write 0 for snapshot
+            // messages
+          } catch (const std::exception &e) {
+            LOG_ERROR("Error processing PCAP payload: ", e.what());
+            isSnapshotOrError = true; // Treat errors as snapshot (write 0)
+          } catch (...) {
+            LOG_ERROR("Unknown error processing PCAP payload");
+            isSnapshotOrError = true; // Treat errors as snapshot (write 0)
+          }
+
+          // Use the existing writeOutput method for consistent behavior
+          writeOutput(isSnapshotOrError,
+                      0); // Use frame counter 0 for PCAP mode
         });
   } catch (const std::runtime_error &e) {
     // Handle PcapReader-specific errors
@@ -217,7 +254,7 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
   const size_t min_ip_header_size =
       sizeof(EthernetHeader) + sizeof(IPv4Header); // Eth=14, IPv4=20 -> 34
   const int max_retries =
-      3; // Maximum number of retry attempts before giving up
+      15; // Maximum number of retry attempts before giving up
   int retry_count = 0;
 
   // 1. Wait for minimum Ethernet alignment data
@@ -421,11 +458,11 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
     return info;
   }
 
-  // 8. Filter by Source IP and Protocol
-  info.isSnapshot = (info.sourceIP == snapshotIP_);
-  info.isUpdate = (info.sourceIP == updateIP_);
+  // 8. Check if this is from one of our target IPs
+  info.isTargetIP =
+      (info.sourceIP == snapshotIP_ || info.sourceIP == updateIP_);
 
-  if (!info.isSnapshot && !info.isUpdate) {
+  if (!info.isTargetIP) {
     LOG_TRACE("[Frame ", frameCounter, "] Skipping frame from non-target IP.");
     info.valid = false; // Mark as skip
     // Keep alignedFrameSize as calculated, since we waited for it
@@ -441,7 +478,7 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
     return info;
   }
 
-  // 9. Process UDP Header and Payload (Only if it's a target UDP packet)
+  // 9. Process UDP Header and extract payload
   info.udpHeader = reinterpret_cast<const UDPHeader *>(
       info.rawDataStart + sizeof(EthernetHeader) + info.ipHeaderLength);
   uint16_t udpTotalLength = 0;
@@ -517,9 +554,14 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
     return info;
   }
 
-  // If we reached here and it's a snapshot or update UDP packet, mark as valid
-  // for processing
-  info.valid = true;
+  // If we reached here with a valid payload, mark the packet as valid
+  info.valid = (info.payload != nullptr && info.payloadLength > 0);
+
+  if (!info.valid) {
+    LOG_DEBUG("[Frame ", frameCounter,
+              "] Packet from target IP has no valid payload");
+  }
+
   return info;
 }
 
@@ -632,26 +674,25 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
   }
 }
 
-// Helper function to process the payload of a valid packet
-bool FrameProcessor::processPayload(const PacketInfo &packetInfo,
-                                    uint64_t frameCounter) {
+// Helper function to process a valid packet's payload
+bool FrameProcessor::processPacketPayload(const PacketInfo &packetInfo,
+                                          uint64_t frameCounter) {
+  if (!packetInfo.payload || packetInfo.payloadLength == 0) {
+    LOG_ERROR("[Frame ", frameCounter,
+              "] Called processPacketPayload with empty payload");
+    return true; // Error
+  }
+
   bool processingError = false;
+
   try {
-    if (packetInfo.payload && packetInfo.payloadLength > 0) {
-      LOG_TRACE("[Frame ", frameCounter, "] Parsing payload (",
-                packetInfo.payloadLength, " bytes)...");
-      protocolParser_.parsePayload(packetInfo.payload,
-                                   packetInfo.payloadLength);
-      LOG_TRACE("[Frame ", frameCounter, "] Payload parsing complete.");
-    } else {
-      // Log if it was an expected packet type but had no payload
-      if (packetInfo.isSnapshot || packetInfo.isUpdate) {
-        LOG_WARN("[Frame ", frameCounter,
-                 "] Target UDP packet received with zero or invalid payload "
-                 "length (",
-                 packetInfo.payloadLength, ").");
-      }
-    }
+    LOG_TRACE("[Frame ", frameCounter, "] Parsing payload (",
+              packetInfo.payloadLength, " bytes)...");
+
+    // Let the protocol parser handle the parsing logic
+    protocolParser_.parsePayload(packetInfo.payload, packetInfo.payloadLength);
+
+    LOG_TRACE("[Frame ", frameCounter, "] Payload parsing complete.");
   } catch (const std::exception &e) {
     LOG_ERROR("[Frame ", frameCounter, "] Error parsing payload: ", e.what());
     processingError = true; // Mark error to treat as snapshot for output
@@ -660,6 +701,7 @@ bool FrameProcessor::processPayload(const PacketInfo &packetInfo,
               "] Unknown error during payload parsing.");
     processingError = true;
   }
+
   return processingError;
 }
 
@@ -698,28 +740,34 @@ void FrameProcessor::advanceInputQueue(const PacketInfo &packetInfo,
 void FrameProcessor::processSingleFrame(uint64_t frameCounter) {
   LOG_DEBUG("[Frame ", frameCounter, "] ----- Start Processing -----");
 
-  // 1. Parse the next packet
+  // 1. Parse the next packet (network level)
   PacketInfo packetInfo = parseNextPacket(frameCounter);
 
-  // 2. Handle invalid/skipped packets - advance and return early
+  // 2. Handle invalid/skipped packets - write 0 to output and advance
   if (!packetInfo.valid) {
-    LOG_TRACE("[Frame ", frameCounter, "] Packet marked invalid or skipped.");
-    advanceInputQueue(packetInfo,
-                      frameCounter); // Advance even for invalid packets
-    LOG_TRACE("[Frame ", frameCounter,
-              "] ----- End Processing (Skipped) -----");
+    LOG_DEBUG("[Frame ", frameCounter, "] Invalid packet, writing 0 to output");
+    writeOutput(true, frameCounter); // Write 0 for invalid packets
+    advanceInputQueue(packetInfo, frameCounter);
     return;
   }
 
-  // 3. Process valid packet payload
-  bool processingError = processPayload(packetInfo, frameCounter);
+  // 3. Process payload (application level)
+  bool processingError = processPacketPayload(packetInfo, frameCounter);
 
-  // 4. Write Output
-  // Write 0 if it was a snapshot frame OR if a processing error occurred on an
-  // update frame.
-  writeOutput(packetInfo.isSnapshot || processingError, frameCounter);
+  // 4. Determine if this is a snapshot message by asking the protocol parser
+  MessageType msgType = ProtocolParser::detectMessageType(
+      packetInfo.payload, packetInfo.payloadLength);
+  bool isSnapshotMessage = (msgType == MessageType::SNAPSHOT);
 
-  // 5. Advance Input Queue Consumer
+  LOG_DEBUG("[Frame ", frameCounter, "] Processing error: ", processingError,
+            " messageType: ", static_cast<int>(msgType),
+            " isSnapshot: ", isSnapshotMessage);
+
+  // 5. Write Output
+  // Write 0 if it was a snapshot message OR if a processing error occurred
+  writeOutput(isSnapshotMessage || processingError, frameCounter);
+
+  // 6. Advance Input Queue Consumer
   advanceInputQueue(packetInfo, frameCounter);
 
   LOG_TRACE("[Frame ", frameCounter, "] ----- End Processing -----");
