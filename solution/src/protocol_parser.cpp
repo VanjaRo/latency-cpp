@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 
 // Decode ZigZag encoded vint
@@ -51,15 +52,76 @@ constexpr size_t INSTRUMENT_INFO_TOTAL_LEN =
     INSTRUMENT_NAME_LEN + INSTRUMENT_UNUSED_LEN + INSTRUMENT_TICK_SIZE_LEN +
     INSTRUMENT_REFERENCE_PRICE_LEN + INSTRUMENT_ID_LEN; // Should be 112
 
+// Helper function to dump hex bytes for debugging
+void ProtocolParser::dumpHexBytes(const uint8_t *data, size_t size,
+                                  const char *prefix) {
+  constexpr size_t MAX_DUMP = 64; // Maximum bytes to dump
+  size_t dumpSize = std::min(size, MAX_DUMP);
+
+  std::ostringstream oss;
+  oss << prefix << " (" << size << " bytes): ";
+
+  for (size_t i = 0; i < dumpSize; ++i) {
+    char buf[4];
+    snprintf(buf, sizeof(buf), "%02x ", data[i]);
+    oss << buf;
+
+    // Add line break every 16 bytes for readability
+    if ((i + 1) % 16 == 0 && i < dumpSize - 1) {
+      oss << "\n                    "; // Align continuation lines
+    }
+  }
+
+  if (size > MAX_DUMP) {
+    oss << "... (" << (size - MAX_DUMP) << " more bytes)";
+  }
+
+  LOG_DEBUG(oss.str());
+}
+
 void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
   size_t current_offset = 0; // Need an offset to track position
+  LOG_DEBUG("Starting to parse UDP payload of size ", size, " bytes");
+  dumpHexBytes(data, std::min(size, static_cast<size_t>(32)),
+               "Payload starts with");
+
+  // Make sure we can at least read a header
+  if (size < sizeof(FrameHeader)) {
+    LOG_ERROR("UDP payload too small to contain even a single frame header: ",
+              size, " bytes < ", sizeof(FrameHeader), " bytes");
+    return;
+  }
 
   while (current_offset + sizeof(FrameHeader) <= size) { // Check if header fits
+    // Important sanity check - ensure we haven't advanced too far
+    if (current_offset >= size) {
+      LOG_ERROR("Parsing error: current_offset (", current_offset,
+                ") exceeds payload size (", size, ")");
+      break;
+    }
 
-    const FrameHeader *header =
-        getFieldPtr<FrameHeader>(data, current_offset, size);
+    // Extract header
+    const FrameHeader *header = nullptr;
+    try {
+      header = getFieldPtr<FrameHeader>(data, current_offset, size);
+    } catch (const std::runtime_error &e) {
+      LOG_ERROR("Error accessing frame header at offset ", current_offset, ": ",
+                e.what());
+      break;
+    }
+
+    // Validate header data
+    if (header->length == 0) {
+      LOG_WARN("Found message with zero length at offset ", current_offset,
+               ", typeId=", std::hex, static_cast<int>(header->typeId),
+               std::dec);
+      current_offset += sizeof(FrameHeader);
+      continue;
+    }
+
     size_t header_and_message_size = sizeof(FrameHeader) + header->length;
 
+    // Check if the entire message fits within the available data
     if (current_offset + header_and_message_size > size) {
       LOG_ERROR("Incomplete message: offset=", current_offset,
                 " needed=", header_and_message_size, " available=", size);
@@ -71,25 +133,68 @@ void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
     MessageType msgType = static_cast<MessageType>(header->typeId);
 
     LOG_DEBUG("Processing message type=", std::hex, static_cast<int>(msgType),
-              " size=", std::dec, messageSize, " at offset ", current_offset);
+              " size=", std::dec, messageSize, " at offset ", current_offset,
+              " (FrameHeader size=", sizeof(FrameHeader), ")");
+    dumpHexBytes(data + current_offset,
+                 std::min(sizeof(FrameHeader) + 16, size - current_offset),
+                 "Header and message start");
 
     switch (msgType) {
     case MessageType::SNAPSHOT: {
       if (messageSize < SNAPSHOT_HEADER_SKIP) {
-        LOG_ERROR("Snapshot message too short after header skip");
+        LOG_ERROR("Snapshot message too short after header skip: ", messageSize,
+                  " bytes < ", SNAPSHOT_HEADER_SKIP, " bytes");
         break;
       }
+      LOG_DEBUG("Snapshot message: skipping additional ", SNAPSHOT_HEADER_SKIP,
+                " bytes of header");
+      dumpHexBytes(messageData,
+                   std::min(SNAPSHOT_HEADER_SKIP + 16, messageSize),
+                   "Snapshot header and content start");
+
+      // Skip the additional message header bytes as described in README
       messageData += SNAPSHOT_HEADER_SKIP;
-      parseSnapshotMessage(messageData, messageSize);
+
+      // Important: per README, we're not adjusting messageSize since the length
+      // field already accounts only for the content after the common 3-byte
+      // header
+      try {
+        LOG_DEBUG("Passing messageSize of ", messageSize,
+                  " bytes to parseSnapshotMessage");
+        parseSnapshotMessage(messageData, messageSize);
+      } catch (const std::exception &e) {
+        LOG_ERROR("Exception in parseSnapshotMessage: ", e.what());
+      } catch (...) {
+        LOG_ERROR("Unknown exception in parseSnapshotMessage");
+      }
       break;
     }
     case MessageType::UPDATE: {
       if (messageSize < UPDATE_HEADER_SKIP) {
-        LOG_ERROR("Update message too short after header skip");
+        LOG_ERROR("Update message too short after header skip: ", messageSize,
+                  " bytes < ", UPDATE_HEADER_SKIP, " bytes");
         break;
       }
+      LOG_DEBUG("Update message: skipping additional ", UPDATE_HEADER_SKIP,
+                " bytes of header");
+      dumpHexBytes(messageData, std::min(UPDATE_HEADER_SKIP + 16, messageSize),
+                   "Update header and content start");
+
+      // Skip the additional message header bytes as described in README
       messageData += UPDATE_HEADER_SKIP;
-      parseUpdateMessage(messageData, messageSize);
+
+      // Important: per README, we're not adjusting messageSize since the length
+      // field already accounts only for the content after the common 3-byte
+      // header
+      try {
+        LOG_DEBUG("Passing messageSize of ", messageSize,
+                  " bytes to parseUpdateMessage");
+        parseUpdateMessage(messageData, messageSize);
+      } catch (const std::exception &e) {
+        LOG_ERROR("Exception in parseUpdateMessage: ", e.what());
+      } catch (...) {
+        LOG_ERROR("Unknown exception in parseUpdateMessage");
+      }
       break;
     }
     default:
@@ -98,19 +203,38 @@ void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
       break;
     }
 
-    current_offset +=
-        header_and_message_size; // Move to the next potential message
+    // Advance to the next message
+    LOG_DEBUG("Advanced to next message, from offset ", current_offset, " to ",
+              (current_offset + header_and_message_size), " of ", size,
+              " bytes total");
+    current_offset += header_and_message_size;
   }
 
   if (current_offset < size) {
     LOG_WARN("Extra data remaining at the end of UDP payload: ",
              (size - current_offset), " bytes.");
+    dumpHexBytes(data + current_offset,
+                 std::min(size - current_offset, static_cast<size_t>(32)),
+                 "Remaining unprocessed data");
+  } else if (current_offset == size) {
+    LOG_DEBUG("Successfully parsed entire UDP payload of ", size, " bytes");
+  } else if (current_offset > size) {
+    LOG_ERROR("Parsing error detected: advanced past end of payload (",
+              current_offset, " > ", size, ")");
   }
 }
 
 // Private helper methods (add these to the implementation)
 
 void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
+  LOG_DEBUG("--- Started parsing snapshot message, data size=", size,
+            " bytes ---");
+  LOG_DEBUG("Note: 'data' pointer has already been advanced past "
+            "SNAPSHOT_HEADER_SKIP bytes");
+
+  dumpHexBytes(data, std::min(size, static_cast<size_t>(32)),
+               "Beginning of snapshot content");
+
   size_t offset = 0;
   int32_t currentInstrumentId = -1;
 
@@ -272,9 +396,19 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
   } else {
     LOG_DEBUG("End of snapshot message. No active instrument to finalize.");
   }
+  LOG_DEBUG("--- Finished parsing snapshot message, processed ", offset, " of ",
+            size, " bytes ---");
 }
 
 void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
+  LOG_DEBUG("--- Started parsing update message, data size=", size,
+            " bytes ---");
+  LOG_DEBUG("Note: 'data' pointer has already been advanced past "
+            "UPDATE_HEADER_SKIP bytes");
+
+  dumpHexBytes(data, std::min(size, static_cast<size_t>(32)),
+               "Beginning of update content");
+
   size_t offset = 0;
   UpdateHeader currentHeader = {}; // Header for the current group
   std::vector<CachedParsedUpdateEvent>
@@ -487,6 +621,8 @@ void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
     LOG_TRACE("Skipping handling of final update group for untracked id=",
               currentHeader.instrumentId);
   }
+  LOG_DEBUG("--- Finished parsing update message, processed ", offset, " of ",
+            size, " bytes ---");
 }
 
 bool ProtocolParser::parseOrderbookField(const uint8_t *data, size_t size,

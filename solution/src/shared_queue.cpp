@@ -1,4 +1,5 @@
 #include "shared_queue.h"
+#include "protocol_logger.h"
 #include <cstring>
 #include <stdexcept>
 #include <sys/stat.h> // Include for stat
@@ -106,6 +107,7 @@ const uint8_t *SharedQueue::getReadPtr() const { return buffer + getReadPos(); }
 // Accepts bytes aligned to 8-byte boundary
 void SharedQueue::advanceConsumer(uint32_t bytes) {
   // bytes = SharedQueue::align8(bytes);
+  bytes = SharedQueue::align8(bytes); // Ensure 8-byte alignment
   std::atomic_fetch_add_explicit(&header->consumer_offset, bytes,
                                  std::memory_order_release);
 }
@@ -113,7 +115,19 @@ void SharedQueue::advanceConsumer(uint32_t bytes) {
 size_t SharedQueue::getReadableBytes() const {
   uint32_t producer = header->producer_offset.load(std::memory_order_acquire);
   uint32_t consumer = header->consumer_offset.load(std::memory_order_acquire);
-  return producer - consumer;
+
+  // Check if consumer has somehow gotten ahead of producer, which shouldn't
+  // happen in normal operation. If it has, it indicates a potential bug or
+  // corruption.
+  if (consumer > producer) {
+    // Log the anomaly
+    LOG_ERROR("Consumer offset (", consumer, ") is ahead of producer offset (",
+              producer,
+              "). This should never happen. Returning 0 bytes available.");
+    return 0; // Return 0 to indicate no bytes are available
+  }
+
+  return producer - consumer; // Normal case
 }
 
 bool SharedQueue::canWrite(size_t bytes) const {
@@ -125,6 +139,7 @@ uint8_t *SharedQueue::getWritePtr() { return buffer + getWritePos(); }
 // Accepts bytes aligned to 8-byte boundary
 void SharedQueue::advanceProducer(uint32_t bytes) {
   // bytes = SharedQueue::align8(bytes);
+  bytes = SharedQueue::align8(bytes); // Ensure 8-byte alignment
   std::atomic_fetch_add_explicit(&header->producer_offset, bytes,
                                  std::memory_order_release);
 }
@@ -132,5 +147,21 @@ void SharedQueue::advanceProducer(uint32_t bytes) {
 size_t SharedQueue::getWritableBytes() const {
   uint32_t producer = header->producer_offset.load(std::memory_order_acquire);
   uint32_t consumer = header->consumer_offset.load(std::memory_order_acquire);
-  return bufferSize - (producer - consumer);
+
+  // Check if consumer has somehow gotten ahead of producer
+  if (consumer > producer) {
+    LOG_ERROR("Consumer offset (", consumer, ") is ahead of producer offset (",
+              producer,
+              "). This should never happen. Assuming buffer is full.");
+    return 0; // Assume buffer is full to prevent further errors
+  }
+
+  uint32_t used_bytes = producer - consumer;
+  if (used_bytes > bufferSize) {
+    LOG_ERROR("Used bytes (", used_bytes, ") exceeds buffer size (", bufferSize,
+              "). Queue corruption detected. Returning 0 writable bytes.");
+    return 0;
+  }
+
+  return bufferSize - used_bytes;
 }

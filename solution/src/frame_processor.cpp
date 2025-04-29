@@ -150,17 +150,27 @@ bool FrameProcessor::waitForBytes(size_t requiredBytes, uint64_t frameCounter,
   int wait_count = 0;
   const int max_wait_cycles = 10000000; // ~100 seconds timeout with 10us sleep
   const int log_interval = 100000;      // Log every second or so
-  // bool overflow_warning_logged = false; // Track if we logged the warning //
-  // Removed
 
   while (true) { // Loop until we break due to success or failure
-    // Get readable bytes using uint32_t subtraction (handles wrap-around)
+    // Get current offset values directly to check them
+    uint32_t current_producer =
+        inputQueue_->header->producer_offset.load(std::memory_order_acquire);
+    uint32_t current_consumer =
+        inputQueue_->header->consumer_offset.load(std::memory_order_acquire);
+
+    // Double check relationship between producer and consumer offsets
+    if (current_consumer > current_producer) {
+      LOG_ERROR("[Frame ", frameCounter, "] [", waitReason,
+                " WAIT ERROR] Consumer offset (", current_consumer,
+                ") ahead of producer offset (", current_producer,
+                "). Queue corrupted!");
+      return false; // Signal error condition
+    }
+
+    // Get readable bytes after verification
     readableBytes = inputQueue_->getReadableBytes();
 
     // --- Check 1: Do we have enough bytes? ---
-    // This is the only check needed for availability.
-    // The uint32_t subtraction in getReadableBytes correctly handles
-    // wrap-around.
     if (readableBytes >= requiredBytes) {
       break; // Exit the while loop, success!
     }
@@ -168,10 +178,6 @@ bool FrameProcessor::waitForBytes(size_t requiredBytes, uint64_t frameCounter,
     // --- Check 2: Timeout ---
     if (wait_count >= max_wait_cycles) {
       // Log the state at timeout
-      uint32_t current_producer =
-          inputQueue_->header->producer_offset.load(std::memory_order_relaxed);
-      uint32_t current_consumer =
-          inputQueue_->header->consumer_offset.load(std::memory_order_relaxed);
       LOG_ERROR("[Frame ", frameCounter, "] [", waitReason,
                 " WAIT TIMEOUT] Stuck waiting for ", requiredBytes,
                 " bytes. Have ", readableBytes, " (Prod: ", current_producer,
@@ -181,10 +187,6 @@ bool FrameProcessor::waitForBytes(size_t requiredBytes, uint64_t frameCounter,
 
     // --- Wait Logic ---
     if (wait_count == 0 || wait_count % log_interval == 0) {
-      uint32_t current_producer =
-          inputQueue_->header->producer_offset.load(std::memory_order_relaxed);
-      uint32_t current_consumer =
-          inputQueue_->header->consumer_offset.load(std::memory_order_relaxed);
       LOG_DEBUG("[Frame ", frameCounter, "] [", waitReason,
                 " WAIT] Waiting for ", requiredBytes, " bytes, have ",
                 readableBytes, " (Prod: ", current_producer,
@@ -214,37 +216,69 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
   const size_t min_eth_alignment = 8; // Check alignment boundary
   const size_t min_ip_header_size =
       sizeof(EthernetHeader) + sizeof(IPv4Header); // Eth=14, IPv4=20 -> 34
+  const int max_retries =
+      3; // Maximum number of retry attempts before giving up
+  int retry_count = 0;
 
   // 1. Wait for minimum Ethernet alignment data
-  if (!waitForBytes(min_eth_alignment, frameCounter, "ETH_ALIGN")) {
-    throw std::runtime_error(
-        "[Frame " + std::to_string(frameCounter) +
-        "] waitForBytes failed (likely input queue overrun/lapping/timeout) "
-        "while waiting for ETH_ALIGN.");
+  while (!waitForBytes(min_eth_alignment, frameCounter, "ETH_ALIGN")) {
+    retry_count++;
+    LOG_WARN("[Frame ", frameCounter, "] waitForBytes failed (attempt ",
+             retry_count, ") while waiting for ETH_ALIGN. Will keep waiting.");
+
+    if (retry_count >= max_retries) {
+      LOG_ERROR("[Frame ", frameCounter,
+                "] Multiple waitForBytes failures for ETH_ALIGN. Returning "
+                "invalid packet.");
+      info.valid = false;
+      info.alignedFrameSize =
+          min_eth_alignment; // Set size to advance by minimal amount
+      return info;
+    }
+
+    // Short sleep before retry
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
+
   info.bytesAvailableWhenParsed =
       inputQueue_->getReadableBytes(); // Initial read
 
   // 2. Peek at Ethernet Header
   info.rawDataStart = inputQueue_->getReadPtr();
   if (!info.rawDataStart) {
-    throw std::runtime_error(
-        "[Frame " + std::to_string(frameCounter) +
-        "] FATAL: getReadPtr() returned nullptr after ETH_ALIGN wait!");
+    LOG_ERROR("[Frame ", frameCounter,
+              "] getReadPtr() returned nullptr after ETH_ALIGN wait! Returning "
+              "invalid packet.");
+    info.valid = false;
+    info.alignedFrameSize = min_eth_alignment;
+    return info;
   }
   info.ethHeader = reinterpret_cast<const EthernetHeader *>(info.rawDataStart);
+
+  //   Debug ethernet header print
+  LOG_DEBUG("[Frame ", frameCounter,
+            "] Ethernet header: ", "Source MAC: ", info.ethHeader->srcMac,
+            "Destination MAC: ", info.ethHeader->destMac,
+            "EtherType: ", info.ethHeader->etherType);
 
   try {
     info.etherType = ntohs(info.ethHeader->etherType);
     LOG_TRACE("[Frame ", frameCounter, "] EtherType = 0x", std::hex,
               info.etherType, std::dec);
   } catch (const std::exception &e) {
-    throw std::runtime_error("[Frame " + std::to_string(frameCounter) +
-                             "] Exception accessing etherType: " + e.what());
+    LOG_ERROR("[Frame ", frameCounter,
+              "] Exception accessing etherType: ", e.what(),
+              " Returning invalid packet.");
+    info.valid = false;
+    info.alignedFrameSize = min_eth_alignment;
+    return info;
   } catch (...) {
-    throw std::runtime_error(
-        "[Frame " + std::to_string(frameCounter) +
-        "] FATAL: Unknown exception accessing etherType. Corrupted buffer?");
+    LOG_ERROR("[Frame ", frameCounter,
+              "] Unknown exception accessing etherType. Possible corrupted "
+              "buffer. Returning invalid packet.");
+    info.valid = false;
+    info.alignedFrameSize = min_eth_alignment;
+    return info;
   }
 
   // 3. Handle non-IP frames
@@ -258,20 +292,36 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
   }
 
   // 4. Wait for full Ethernet + minimum IP header
-  if (!waitForBytes(min_ip_header_size, frameCounter, "IP_HEADER")) {
-    throw std::runtime_error(
-        "[Frame " + std::to_string(frameCounter) +
-        "] waitForBytes failed (likely input queue overrun/lapping/timeout) "
-        "while waiting for IP_HEADER.");
+  retry_count = 0;
+  while (!waitForBytes(min_ip_header_size, frameCounter, "IP_HEADER")) {
+    retry_count++;
+    LOG_WARN("[Frame ", frameCounter, "] waitForBytes failed (attempt ",
+             retry_count, ") while waiting for IP_HEADER. Will keep waiting.");
+
+    if (retry_count >= max_retries) {
+      LOG_ERROR("[Frame ", frameCounter,
+                "] Multiple waitForBytes failures for IP_HEADER. Returning "
+                "invalid packet.");
+      info.valid = false;
+      info.alignedFrameSize = min_eth_alignment;
+      return info;
+    }
+
+    // Short sleep before retry
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
+
   info.bytesAvailableWhenParsed = inputQueue_->getReadableBytes();
 
   // Re-get pointer as buffer might have wrapped
   info.rawDataStart = inputQueue_->getReadPtr();
   if (!info.rawDataStart) {
-    throw std::runtime_error(
-        "[Frame " + std::to_string(frameCounter) +
-        "] FATAL: getReadPtr() null after IP header wait!");
+    LOG_ERROR("[Frame ", frameCounter,
+              "] getReadPtr() returned nullptr after IP_HEADER wait! Returning "
+              "invalid packet.");
+    info.valid = false;
+    info.alignedFrameSize = min_eth_alignment;
+    return info;
   }
   info.ethHeader = reinterpret_cast<const EthernetHeader *>(info.rawDataStart);
   info.ipHeader = reinterpret_cast<const IPv4Header *>(info.rawDataStart +
@@ -317,15 +367,18 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
 
   } catch (const std::exception &e) { // Catch specific standard exceptions
     LOG_ERROR("[Frame ", frameCounter,
-              "] Exception accessing IP Header fields: ", e.what());
-    // Rethrow or handle as needed - let's throw for consistency
-    throw std::runtime_error(
-        "[Frame " + std::to_string(frameCounter) +
-        "] Exception accessing IP Header fields: " + e.what());
+              "] Exception accessing IP Header fields: ", e.what(),
+              " Returning invalid packet.");
+    info.valid = false;
+    info.alignedFrameSize = min_eth_alignment;
+    return info;
   } catch (...) {
-    throw std::runtime_error("[Frame " + std::to_string(frameCounter) +
-                             "] FATAL: Unknown exception accessing IP Header "
-                             "fields. Corrupted buffer?");
+    LOG_ERROR("[Frame ", frameCounter,
+              "] Unknown exception accessing IP Header fields. Possible "
+              "corrupted buffer. Returning invalid packet.");
+    info.valid = false;
+    info.alignedFrameSize = min_eth_alignment;
+    return info;
   }
 
   // 6. Calculate required frame size and wait for it
@@ -335,22 +388,37 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
   LOG_TRACE("[Frame ", frameCounter, "] Calculated frameSize=", info.frameSize,
             ", alignedFrameSize=", info.alignedFrameSize);
 
-  if (!waitForBytes(info.frameSize, frameCounter, "FRAME_DATA")) {
+  retry_count = 0;
+  while (!waitForBytes(info.frameSize, frameCounter, "FRAME_DATA")) {
+    retry_count++;
+    LOG_WARN("[Frame ", frameCounter, "] waitForBytes failed (attempt ",
+             retry_count, ") while waiting for FRAME_DATA (", info.frameSize,
+             " bytes). Will keep waiting.");
 
-    throw std::runtime_error(
-        "[Frame " + std::to_string(frameCounter) +
-        "] waitForBytes failed (likely input queue overrun/lapping/timeout) "
-        "while waiting for FRAME_DATA (" +
-        std::to_string(info.frameSize) + " bytes).");
+    if (retry_count >= max_retries) {
+      LOG_ERROR("[Frame ", frameCounter,
+                "] Multiple waitForBytes failures for FRAME_DATA. Returning "
+                "invalid packet.");
+      info.valid = false;
+      info.alignedFrameSize = min_eth_alignment;
+      return info;
+    }
+
+    // Short sleep before retry
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
+
   info.bytesAvailableWhenParsed = inputQueue_->getReadableBytes();
 
   // 7. Re-get pointers and extract UDP info (if applicable)
   info.rawDataStart = inputQueue_->getReadPtr();
   if (!info.rawDataStart) {
-    throw std::runtime_error(
-        "[Frame " + std::to_string(frameCounter) +
-        "] FATAL: getReadPtr() null after frame data wait!");
+    LOG_ERROR("[Frame ", frameCounter,
+              "] getReadPtr() returned nullptr after frame data wait! "
+              "Returning invalid packet.");
+    info.valid = false;
+    info.alignedFrameSize = min_eth_alignment;
+    return info;
   }
 
   // 8. Filter by Source IP and Protocol
@@ -431,10 +499,22 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
         }
       }
     }
+  } catch (const std::exception &e) {
+    LOG_ERROR("[Frame ", frameCounter,
+              "] Exception accessing UDP Header/Payload: ", e.what(),
+              " Returning invalid packet.");
+    info.valid = false;
+    info.alignedFrameSize =
+        info.alignedFrameSize > 0 ? info.alignedFrameSize : min_eth_alignment;
+    return info;
   } catch (...) {
-    throw std::runtime_error(
-        "[Frame " + std::to_string(frameCounter) +
-        "] FATAL: Exception accessing UDP Header/Payload. Corrupted buffer?");
+    LOG_ERROR("[Frame ", frameCounter,
+              "] Unknown exception accessing UDP Header/Payload. Possible "
+              "corrupted buffer. Returning invalid packet.");
+    info.valid = false;
+    info.alignedFrameSize =
+        info.alignedFrameSize > 0 ? info.alignedFrameSize : min_eth_alignment;
+    return info;
   }
 
   // If we reached here and it's a snapshot or update UDP packet, mark as valid
@@ -586,15 +666,31 @@ bool FrameProcessor::processPayload(const PacketInfo &packetInfo,
 // Helper function to advance the input queue consumer
 void FrameProcessor::advanceInputQueue(const PacketInfo &packetInfo,
                                        uint64_t frameCounter) {
-  LOG_TRACE("[Frame ", frameCounter, "] Advancing consumer by aligned size: ",
-            packetInfo.alignedFrameSize);
+  uint32_t currentOffset =
+      inputQueue_->header->consumer_offset.load(std::memory_order_relaxed);
+
+  LOG_DEBUG("[Frame ", frameCounter, "] Advancing consumer by aligned size: ",
+            packetInfo.alignedFrameSize,
+            " (original frameSize=", packetInfo.frameSize,
+            ", current offset=", currentOffset, ")");
+
   if (packetInfo.alignedFrameSize > 0) {
     inputQueue_->advanceConsumer(packetInfo.alignedFrameSize);
+    uint32_t newOffset =
+        inputQueue_->header->consumer_offset.load(std::memory_order_relaxed);
+    LOG_DEBUG("[Frame ", frameCounter, "] Consumer advanced from ",
+              currentOffset, " to ", newOffset,
+              " (delta: ", (newOffset - currentOffset), ")");
   } else {
     LOG_WARN("[Frame ", frameCounter,
              "] Packet resulted in 0 alignedFrameSize (Likely non-IP or "
              "invalid header). Advancing by minimum 8 bytes.");
     inputQueue_->advanceConsumer(SharedQueue::align8(8));
+    uint32_t newOffset =
+        inputQueue_->header->consumer_offset.load(std::memory_order_relaxed);
+    LOG_DEBUG("[Frame ", frameCounter, "] Consumer advanced from ",
+              currentOffset, " to ", newOffset,
+              " (delta: ", (newOffset - currentOffset), ")");
   }
 }
 
@@ -632,24 +728,55 @@ void FrameProcessor::processSingleFrame(uint64_t frameCounter) {
 // Main processing loop for Queue mode
 void FrameProcessor::runQueue() {
   LOG_INFO("Starting frame processing loop (Queue mode).");
+
+  // Check for null queue pointers
   if (!inputQueue_ || !outputQueue_) {
-    throw std::runtime_error(
-        "FATAL: Input or Output queue is NULL in runQueue!");
+    LOG_ERROR(
+        "FATAL: Input or Output queue is NULL in runQueue! Cannot proceed.");
+    return; // Return instead of throwing
   }
 
   uint64_t frameCounter = 1; // Initialize frame counter
+  const int MAX_CONSECUTIVE_ERRORS =
+      100; // Maximum consecutive errors before giving up
+  int consecutiveErrors = 0;
 
-  try {
-    while (true) {
+  while (true) {
+    try {
       processSingleFrame(frameCounter);
-      frameCounter++; // Increment frame counter for the next iteration
+      frameCounter++;        // Increment frame counter for the next iteration
+      consecutiveErrors = 0; // Reset error counter on success
+    } catch (const std::exception &e) {
+      consecutiveErrors++;
+      LOG_ERROR("Caught exception in frame processing loop: ", e.what(),
+                " (frame ", frameCounter, ", error #", consecutiveErrors, ")");
+
+      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        LOG_ERROR("Too many consecutive errors (", consecutiveErrors,
+                  "), halting processing.");
+        break;
+      }
+
+      // Sleep briefly before retrying
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      // Still increment frame counter to avoid getting stuck on the same frame
+      frameCounter++;
+    } catch (...) {
+      consecutiveErrors++;
+      LOG_ERROR("Caught unknown exception in frame processing loop ", "(frame ",
+                frameCounter, ", error #", consecutiveErrors, ")");
+
+      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        LOG_ERROR("Too many consecutive errors (", consecutiveErrors,
+                  "), halting processing.");
+        break;
+      }
+
+      // Sleep briefly before retrying
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      // Still increment frame counter to avoid getting stuck on the same frame
+      frameCounter++;
     }
-  } catch (const std::runtime_error &e) {
-    LOG_ERROR(
-        "Caught runtime error in frame processing loop. Stopping. Error: ",
-        e.what());
-  } catch (...) {
-    LOG_ERROR("Caught unknown exception in frame processing loop. Stopping.");
   }
 
   LOG_INFO("Exiting frame processing loop (Queue mode) after frame ",

@@ -12,6 +12,13 @@
 #include "../lib/LightPcapNg/include/light_pcapng.h"
 #include "../lib/LightPcapNg/include/light_pcapng_ext.h"
 #include "../lib/LightPcapNg/include/light_types.h"
+
+// Forward declaration of processFrameCallback
+static int processFrameCallback(const light_packet_header *frame_header,
+                                const uint8_t *frame_data,
+                                const FrameCallback &callback,
+                                uint32_t snapshotIP, uint32_t updateIP,
+                                bool filterByIP);
 #endif
 
 // Define Implementation struct regardless of USE_LIGHTPCAPNG setting

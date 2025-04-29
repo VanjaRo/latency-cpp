@@ -1,0 +1,3 @@
+[submodule "solution/lib/LightPcapNg"]
+	path = solution/lib/LightPcapNg
+	url = https://github.com/rvelea/LightPcapNg
