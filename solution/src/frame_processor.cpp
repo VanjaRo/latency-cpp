@@ -597,13 +597,13 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
     outputQueue_->advanceProducer(output_size_zero);
     LOG_TRACE("[Frame ", frameCounter, "] Wrote output: 0 (Snapshot/Error)");
   } else {
-    // Process updates
-    auto changedVWAPs = orderbookManager_.getChangedVWAPs();
+    // Get instruments that were updated in this frame and have valid orderbooks
+    auto updatedInstruments = orderbookManager_.getUpdatedInstruments();
 
-    if (changedVWAPs.empty()) {
-      // Write 0 if no VWAPs changed
+    if (updatedInstruments.empty()) {
+      // Write 0 if no updated instruments with valid orderbooks
       LOG_TRACE("[Frame ", frameCounter,
-                "] Preparing to write output: 0 (No VWAP change)");
+                "] Preparing to write output: 0 (No updated instruments)");
       int wait_cycles = 0;
       while (!outputQueue_->canWrite(output_size_zero)) {
         if (wait_cycles % 10000 == 0) {
@@ -612,26 +612,30 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
           uint32_t cons = outputQueue_->header->consumer_offset.load(
               std::memory_order_relaxed);
           LOG_WARN("[Frame ", frameCounter,
-                   "] Waiting to write 0 (no change) to output queue... (Prod:",
+                   "] Waiting to write 0 (no updated instruments) to output "
+                   "queue... (Prod:",
                    prod, " Cons:", cons, ")");
         }
         wait_cycles++;
         std::this_thread::sleep_for(std::chrono::microseconds(5));
       }
       LOG_DEBUG("[Frame ", frameCounter,
-                "] Output queue has space for 0 (no change). Writing...");
+                "] Output queue has space for 0 (no updated instruments). "
+                "Writing...");
       uint32_t *writePtr =
           reinterpret_cast<uint32_t *>(outputQueue_->getWritePtr());
       *writePtr = 0;
       outputQueue_->advanceProducer(output_size_zero);
-      LOG_TRACE("[Frame ", frameCounter, "] Wrote output: 0 (No VWAP change)");
+      LOG_TRACE("[Frame ", frameCounter,
+                "] Wrote output: 0 (No updated instruments)");
     } else {
-      // Write changed VWAPs
+      // Write all updated instruments' VWAPs
       size_t totalBytesToWrite =
-          sizeof(uint32_t) + changedVWAPs.size() * output_size_result_triple;
+          sizeof(uint32_t) +
+          updatedInstruments.size() * output_size_result_triple;
       LOG_TRACE("[Frame ", frameCounter, "] Preparing to write ",
-                changedVWAPs.size(), " VWAP updates (", totalBytesToWrite,
-                " bytes)");
+                updatedInstruments.size(), " instrument VWAPs (",
+                totalBytesToWrite, " bytes)");
       int wait_cycles = 0;
       while (!outputQueue_->canWrite(totalBytesToWrite)) {
         if (wait_cycles % 10000 == 0) {
@@ -640,7 +644,7 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
           uint32_t cons = outputQueue_->header->consumer_offset.load(
               std::memory_order_relaxed);
           LOG_WARN("[Frame ", frameCounter, "] Waiting to write ",
-                   changedVWAPs.size(), " VWAPs (", totalBytesToWrite,
+                   updatedInstruments.size(), " VWAPs (", totalBytesToWrite,
                    " bytes) to output queue... (Prod:", prod, " Cons:", cons,
                    ")");
         }
@@ -648,29 +652,57 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
         std::this_thread::sleep_for(std::chrono::microseconds(5));
       }
       LOG_TRACE("[Frame ", frameCounter, "] Output queue has space for ",
-                changedVWAPs.size(), " VWAPs. Writing...");
+                updatedInstruments.size(), " VWAPs. Writing...");
 
       uint8_t *writePtr = outputQueue_->getWritePtr();
-      uint32_t count = static_cast<uint32_t>(changedVWAPs.size());
+      uint32_t count = static_cast<uint32_t>(updatedInstruments.size());
       memcpy(writePtr, &count, sizeof(uint32_t));
       writePtr += sizeof(uint32_t);
 
-      LOG_TRACE("[Frame ", frameCounter, "] Writing ", count, " VWAP updates:");
-      for (const auto &vwap : changedVWAPs) {
+      // Only log the number of VWAPs being written
+      LOG_TRACE("[Frame ", frameCounter, "] Writing ", count, " VWAP values");
+
+      // In detailed trace mode, identify VWAP updates for this frame
+      if (COMPILE_TIME_LOG_LEVEL >= static_cast<int>(LogLevel::TRACE)) {
+        int updatedCount = 0;
+
+        // Count once to avoid repeating the isVWAPChanged check
+        for (const auto &vwap : updatedInstruments) {
+          if (orderbookManager_.isVWAPChanged(vwap.instrumentId)) {
+            updatedCount++;
+            LOG_TRACE("  -> Updated VWAP: ID:", vwap.instrumentId,
+                      " N:", vwap.numerator, " D:", vwap.denominator);
+          }
+        }
+
+        if (updatedCount > 0) {
+          LOG_TRACE("[Frame ", frameCounter, "] Of ", count,
+                    " updated instruments, ", updatedCount,
+                    " had value updates in this frame");
+        } else {
+          LOG_TRACE(
+              "[Frame ", frameCounter, "] All ", count,
+              " instruments were updated but none had value changes in this "
+              "frame");
+        }
+      }
+
+      // Write the actual data
+      for (const auto &vwap : updatedInstruments) {
         memcpy(writePtr, &vwap.instrumentId, sizeof(uint32_t));
         writePtr += sizeof(uint32_t);
         memcpy(writePtr, &vwap.numerator, sizeof(uint32_t));
         writePtr += sizeof(uint32_t);
         memcpy(writePtr, &vwap.denominator, sizeof(uint32_t));
         writePtr += sizeof(uint32_t);
-        LOG_TRACE("  -> ID:", vwap.instrumentId, " N:", vwap.numerator,
-                  " D:", vwap.denominator);
       }
+
       outputQueue_->advanceProducer(totalBytesToWrite);
       LOG_TRACE("[Frame ", frameCounter, "] Advanced output producer by ",
                 totalBytesToWrite);
     }
-    orderbookManager_.clearChangedVWAPs(); // Clear changes after writing
+    // We still clear the VWAP changed flags after writing
+    orderbookManager_.clearChangedVWAPs();
   }
 }
 

@@ -27,10 +27,10 @@ struct Orderbook {
   double referencePrice;
   int32_t changeNo;
 
-  // Pre-allocated fixed arrays for bids and asks
-  std::array<PriceLevel, MAX_PRICE_LEVELS> asks;
-  std::array<PriceLevel, MAX_PRICE_LEVELS> bids;
-  int askCount;
+  // Use vectors instead of fixed arrays
+  std::vector<PriceLevel> asks;
+  std::vector<PriceLevel> bids;
+  int askCount; // Keep track of actual count, might differ from vector.size()
   int bidCount;
 
   // Pre-computed VWAP components
@@ -95,13 +95,19 @@ public:
   void handleUpdateMessage(const UpdateHeader &header,
                            const std::vector<CachedParsedUpdateEvent> &events);
 
-  // Get changed VWAPs for output
+  // Check if a specific instrument's VWAP has changed
+  bool isVWAPChanged(int32_t instrumentId) const;
+
+  // Get valid orderbooks for output
   struct VWAPResult {
     int32_t instrumentId;
     uint32_t numerator;
     uint32_t denominator;
   };
-  std::vector<VWAPResult> getChangedVWAPs() const;
+  std::vector<VWAPResult> getValidOrderbooks() const;
+
+  // Get instruments that were updated in the current frame
+  std::vector<VWAPResult> getUpdatedInstruments() const;
 
   // Clear the list of changed VWAPs
   void clearChangedVWAPs();
@@ -114,6 +120,9 @@ private:
   std::unordered_map<int32_t, Orderbook> orderbooks;
   std::unordered_set<std::string> trackedInstruments;
   std::unordered_map<int32_t, std::string> idToName;
+
+  // Track instruments that were updated in the current frame
+  std::unordered_set<int32_t> updatedInstruments;
 
   // Cache for out-of-sequence or pre-snapshot updates
   std::unordered_map<int32_t, std::vector<CachedParsedUpdate>>
@@ -135,4 +144,10 @@ private:
 
   // Applies cached updates after a snapshot
   void applyCachedUpdates(Orderbook &orderbook);
+
+  // Helper function to infer missing levels in deletePriceLevel
+  PriceLevel inferMissingLevel(const Orderbook &orderbook, Side side);
+
+  // Helper method to normalize price consistently
+  int64_t normalizePrice(double price, double tickSize);
 };

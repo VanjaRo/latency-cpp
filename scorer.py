@@ -1,5 +1,6 @@
 import argparse
 import sys
+import difflib
 
 def calc_score(lat_data):
     l = [x[0] / x[1] for x in lat_data]
@@ -32,7 +33,19 @@ if __name__ == "__main__":
     if args.correct:
         _, correct_output = read_output(args.correct)
         if output != correct_output:
-            print("Files with results are different", file=sys.stderr)
+            print("Files with results are different:", file=sys.stderr)
+            # Convert lists of lists to lists of strings for diffing
+            output_lines = [' '.join(map(str, line)) for line in output]
+            correct_output_lines = [' '.join(map(str, line)) for line in correct_output]
+            diff = difflib.unified_diff(
+                correct_output_lines,
+                output_lines,
+                fromfile=args.correct,
+                tofile=args.output,
+                lineterm='\n',
+            )
+            for line in diff:
+                sys.stderr.write(line) # Already includes newline
             sys.exit(1)
         if args.check_only:
             sys.exit(0)
