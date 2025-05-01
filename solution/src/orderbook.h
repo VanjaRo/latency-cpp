@@ -109,6 +109,7 @@ struct PriceBuf {
 struct Orderbook {
   int32_t instrumentId;
   double tickSize;
+  double invTickSize; // 1/tickSize precomputed
   double referencePrice;
   int32_t changeNo;
 

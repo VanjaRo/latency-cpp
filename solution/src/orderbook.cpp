@@ -80,6 +80,7 @@ void OrderbookManager::processSnapshotInfo(const InstrumentInfo &info) {
   // Reset orderbook state based on snapshot info
   orderbook.instrumentId = info.instrumentId;
   orderbook.tickSize = info.tickSize;
+  orderbook.invTickSize = 1.0 / orderbook.tickSize;
   orderbook.referencePrice = info.referencePrice;
   orderbook.changeNo = -1;
   orderbook.isValid = true;
@@ -704,140 +705,29 @@ void OrderbookManager::calculateVWAP(Orderbook &orderbook) {
   }
 
   LOG_TRACE("Calculating VWAP for id=", orderbook.instrumentId);
+  // Fast VWAP computation: fixed MAX_PRICE_LEVELS passes with precomputed
+  // invTickSize
+  const auto *bidData = orderbook.bids.data();
+  const auto *askData = orderbook.asks.data();
+  size_t bidCount = orderbook.bids.size();
+  size_t askCount = orderbook.asks.size();
   uint64_t numeratorSum = 0;
   uint64_t denominatorSum = 0;
-
-  // Log the current state of the orderbook
-  LOG_TRACE("Current orderbook state for ID ", orderbook.instrumentId,
-            " - BidCount: ", orderbook.bids.size(),
-            ", AskCount: ", orderbook.asks.size(),
-            ", TickSize: ", orderbook.tickSize,
-            ", Bid vector size: ", orderbook.bids.size(),
-            ", Ask vector size: ", orderbook.asks.size());
-
-  // Determine number of levels to consider for VWAP (top MAX_PRICE_LEVELS)
-  size_t bidLevelsToConsider =
-      std::min((size_t)orderbook.bids.size(), MAX_PRICE_LEVELS);
-  size_t askLevelsToConsider =
-      std::min((size_t)orderbook.asks.size(), MAX_PRICE_LEVELS);
-
-  // Detailed check for zero or negative volume/price entries within considered
-  // levels
-  bool hasZeroOrNegativeEntries = false;
-
-  // Log bids (only those considered for VWAP)
-  LOG_TRACE("Bid levels considered for VWAP (up to ", bidLevelsToConsider,
-            ") for ID ", orderbook.instrumentId, ":");
-  for (size_t i = 0; i < bidLevelsToConsider; ++i) {
-    const auto &level = orderbook.bids[i];
-    LOG_TRACE("  Bid[", i, "]: Price=", level.price, " Volume=", level.volume);
-    if (level.volume <= 0 || level.price <= 0) {
-      LOG_WARN("Zero or negative entry found in Bid[", i,
-               "]: Price=", level.price, " Volume=", level.volume, " for ID ",
-               orderbook.instrumentId);
-      hasZeroOrNegativeEntries = true;
-    }
+  // Bids
+  for (size_t i = 0; i < MAX_PRICE_LEVELS; ++i) {
+    uint64_t vol = (i < bidCount ? bidData[i].volume : 0);
+    double exact = bidData[i].price * orderbook.invTickSize;
+    int64_t norm = static_cast<int64_t>(exact + 0.5);
+    numeratorSum += static_cast<uint64_t>(norm) * vol;
+    denominatorSum += vol;
   }
-
-  // Log asks (only those considered for VWAP)
-  LOG_TRACE("Ask levels considered for VWAP (up to ", askLevelsToConsider,
-            ") for ID ", orderbook.instrumentId, ":");
-  for (size_t i = 0; i < askLevelsToConsider; ++i) {
-    const auto &level = orderbook.asks[i];
-    LOG_TRACE("  Ask[", i, "]: Price=", level.price, " Volume=", level.volume);
-    if (level.volume <= 0 || level.price <= 0) {
-      LOG_WARN("Zero or negative entry found in Ask[", i,
-               "]: Price=", level.price, " Volume=", level.volume, " for ID ",
-               orderbook.instrumentId);
-      hasZeroOrNegativeEntries = true;
-    }
-  }
-
-  if (hasZeroOrNegativeEntries) {
-    LOG_WARN("Zero or negative entries found in orderbook ID ",
-             orderbook.instrumentId,
-             ". These will be skipped in VWAP calculation.");
-  }
-
-  int bidsContributing = 0;
-  // Bids - Iterate only up to bidLevelsToConsider
-  for (size_t i = 0; i < bidLevelsToConsider; ++i) {
-    const auto &level = orderbook.bids[i];
-    if (level.volume > 0 && level.price > 0) {
-      // Use the consistent normalization helper
-      int64_t normalizedPrice = normalizePrice(level.price, orderbook.tickSize);
-
-      // Log the contribution from this level
-      LOG_TRACE("Bid[", i, "] contributes: Price=", level.price,
-                " NormalizedPrice=", normalizedPrice, " Volume=", level.volume,
-                " To numerator: +",
-                (normalizedPrice * static_cast<uint64_t>(level.volume)),
-                " To denominator: +", static_cast<uint64_t>(level.volume));
-
-      // Safety check to avoid overflow
-      if (normalizedPrice > 0 &&
-          static_cast<uint64_t>(normalizedPrice) >
-              UINT64_MAX / static_cast<uint64_t>(level.volume)) {
-        LOG_WARN("Potential overflow in VWAP calculation for ID ",
-                 orderbook.instrumentId, ". Skipping level.");
-        continue;
-      }
-
-      numeratorSum += normalizedPrice * static_cast<uint64_t>(level.volume);
-      denominatorSum += static_cast<uint64_t>(level.volume);
-      bidsContributing++;
-    }
-  }
-
-  int asksContributing = 0;
-  // Asks - Iterate only up to askLevelsToConsider
-  for (size_t i = 0; i < askLevelsToConsider; ++i) {
-    const auto &level = orderbook.asks[i];
-    if (level.volume > 0 && level.price > 0) {
-      // Use the same consistent normalization helper for asks
-      double exactTicks = level.price / orderbook.tickSize;
-      int64_t normalizedPrice = normalizePrice(level.price, orderbook.tickSize);
-
-      // Log extra details for debugging
-      LOG_TRACE("Ask[", i, "] price division: ", level.price, " / ",
-                orderbook.tickSize, " = ", exactTicks, " normalized to ",
-                normalizedPrice);
-
-      // Log the contribution from this level
-      LOG_TRACE("Ask[", i, "] contributes: Price=", level.price,
-                " NormalizedPrice=", normalizedPrice, " Volume=", level.volume,
-                " To numerator: +",
-                (normalizedPrice * static_cast<uint64_t>(level.volume)),
-                " To denominator: +", static_cast<uint64_t>(level.volume));
-
-      // Safety check to avoid overflow
-      if (normalizedPrice > 0 &&
-          static_cast<uint64_t>(normalizedPrice) >
-              UINT64_MAX / static_cast<uint64_t>(level.volume)) {
-        LOG_WARN("Potential overflow in VWAP calculation for ID ",
-                 orderbook.instrumentId, ". Skipping level.");
-        continue;
-      }
-
-      numeratorSum += normalizedPrice * static_cast<uint64_t>(level.volume);
-      denominatorSum += static_cast<uint64_t>(level.volume);
-      asksContributing++;
-    }
-  }
-
-  LOG_TRACE("VWAP contribution summary - Bids contributing: ", bidsContributing,
-            " Asks contributing: ", asksContributing);
-
-  // Log raw totals before truncation
-  LOG_TRACE("Raw VWAP calculation for ID ", orderbook.instrumentId,
-            " - Total numerator: ", numeratorSum,
-            " Total denominator: ", denominatorSum);
-
-  // Expected values comparison (for debugging)
-  if (orderbook.instrumentId == 2882) {
-    LOG_DEBUG("ID 2882 result comparison - Got: numerator=", numeratorSum,
-              " denominator=", denominatorSum,
-              " Expected: numerator=58355 denominator=19");
+  // Asks
+  for (size_t i = 0; i < MAX_PRICE_LEVELS; ++i) {
+    uint64_t vol = (i < askCount ? askData[i].volume : 0);
+    double exact = askData[i].price * orderbook.invTickSize;
+    int64_t norm = static_cast<int64_t>(exact + 0.5);
+    numeratorSum += static_cast<uint64_t>(norm) * vol;
+    denominatorSum += vol;
   }
 
   // Safely truncate to uint32_t - VWAP components are defined as uint32_t in
