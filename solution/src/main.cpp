@@ -2,7 +2,6 @@
 #include <memory>    // For std::unique_ptr
 #include <stdexcept> // For std::runtime_error, std::stoull
 #include <string>
-#include <vector>
 
 #include "frame_processor.h" // Include the new processor
 #include "protocol_logger.h" // Keep for logging

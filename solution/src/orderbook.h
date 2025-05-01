@@ -3,8 +3,10 @@
 #include "protocol_parser.h"
 #include <array>
 #include <cstdint>
+#include <cstring> // for std::memcpy, std::memmove
 #include <map>
 #include <memory>
+#include <memory_resource>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -14,10 +16,93 @@
 // Maximum number of price levels to track
 constexpr size_t MAX_PRICE_LEVELS = 5;
 
+// Inline capacity margin: allow up to DEPTH_MARGIN extra levels before heap
+// fallback
+static constexpr size_t DEPTH_MARGIN = 20;
+static constexpr size_t MAX_DEPTH_STORAGE =
+    MAX_PRICE_LEVELS + DEPTH_MARGIN; // Inline buffer up to 20 levels
+
+static constexpr size_t ARENA_SIZE_MULTIPLIER = 20;
+
 // Price level structure
 struct alignas(64) PriceLevel {
   double price;
   int64_t volume;
+};
+
+// Dedicated PMR arena for PriceBuf heap fallbacks (persistent for program
+// lifetime)
+inline std::pmr::monotonic_buffer_resource priceBufResource(
+    MAX_DEPTH_STORAGE * sizeof(PriceLevel) * ARENA_SIZE_MULTIPLIER,
+    std::pmr::get_default_resource());
+
+// Small-buffer container for PriceLevel: inline capacity up to
+// MAX_DEPTH_STORAGE, heap-fallback beyond
+struct PriceBuf {
+  static constexpr size_t InlineCap = MAX_DEPTH_STORAGE;
+  PriceLevel inline_buf[InlineCap];
+  PriceLevel *heap_buf = nullptr;
+  size_t sz = 0;
+  size_t cap = InlineCap;
+  // Memory resource for fallback allocations
+  std::pmr::memory_resource *mr = &priceBufResource;
+  PriceBuf() = default;
+  ~PriceBuf() {
+    if (heap_buf) {
+      // Deallocate fallback buffer
+      mr->deallocate(heap_buf, cap * sizeof(PriceLevel), alignof(PriceLevel));
+    }
+  }
+  size_t size() const { return sz; }
+  size_t capacity() const { return cap; }
+  bool empty() const { return sz == 0; }
+  PriceLevel *data() { return heap_buf ? heap_buf : inline_buf; }
+  const PriceLevel *data() const { return heap_buf ? heap_buf : inline_buf; }
+  PriceLevel &operator[](size_t idx) { return data()[idx]; }
+  const PriceLevel &operator[](size_t idx) const { return data()[idx]; }
+  void clear() {
+    sz = 0;
+    if (heap_buf) {
+      mr->deallocate(heap_buf, cap * sizeof(PriceLevel), alignof(PriceLevel));
+      heap_buf = nullptr;
+      cap = InlineCap;
+    }
+  }
+  void grow() {
+    size_t oldCap = cap;
+    size_t newCap = cap * 2;
+    // Allocate fallback from PMR arena
+    void *raw = mr->allocate(newCap * sizeof(PriceLevel), alignof(PriceLevel));
+    PriceLevel *newBuf = static_cast<PriceLevel *>(raw);
+    std::memcpy(newBuf, data(), sz * sizeof(PriceLevel));
+    // Deallocate previous heap buffer if any
+    if (heap_buf) {
+      mr->deallocate(heap_buf, oldCap * sizeof(PriceLevel),
+                     alignof(PriceLevel));
+    }
+    heap_buf = newBuf;
+    cap = newCap;
+  }
+  void insert(size_t idx, const PriceLevel &v) {
+    if (sz + 1 > cap)
+      grow();
+    size_t numToMove = sz - idx;
+    if (numToMove > 0)
+      std::memmove(&data()[idx + 1], &data()[idx],
+                   numToMove * sizeof(PriceLevel));
+    data()[idx] = v;
+    ++sz;
+  }
+  void push_back(const PriceLevel &v) { insert(sz, v); }
+  void erase(size_t idx) {
+    if (idx < sz) {
+      size_t numToMove = sz - idx - 1;
+      if (numToMove > 0)
+        std::memmove(&data()[idx], &data()[idx + 1],
+                     numToMove * sizeof(PriceLevel));
+      --sz;
+    }
+  }
 };
 
 // Orderbook structure
@@ -27,11 +112,9 @@ struct Orderbook {
   double referencePrice;
   int32_t changeNo;
 
-  // Use vectors instead of fixed arrays
-  std::vector<PriceLevel> asks;
-  std::vector<PriceLevel> bids;
-  int askCount; // Keep track of actual count, might differ from vector.size()
-  int bidCount;
+  // Price levels container with inline buffer and heap fallback
+  PriceBuf asks;
+  PriceBuf bids;
 
   // Pre-computed VWAP components
   uint32_t vwapNumerator;
@@ -59,11 +142,13 @@ struct CachedParsedUpdateEvent {
 // Structure to hold a complete cached update message (header info + events)
 struct CachedParsedUpdate {
   int64_t changeNo;
-  std::vector<CachedParsedUpdateEvent> events;
-  // No need for instrumentId, refPrice, tickSize here; retrieved from Orderbook
-  // when applying.
-
-  // Add a comparison operator for sorting
+  std::pmr::vector<CachedParsedUpdateEvent> events;
+  // Construct from any container of events into the arena
+  template <typename Container>
+  CachedParsedUpdate(int64_t changeNo_, const Container &evts,
+                     std::pmr::memory_resource *mr)
+      : changeNo(changeNo_), events(evts.begin(), evts.end(), mr) {}
+  // Comparison operator for sorting
   bool operator<(const CachedParsedUpdate &other) const {
     return changeNo < other.changeNo;
   }
@@ -72,6 +157,9 @@ struct CachedParsedUpdate {
 class OrderbookManager {
 public:
   OrderbookManager();
+
+  // Access the memory resource used for cached updates
+  std::pmr::memory_resource *getUpdateResource() { return &updateResource; }
 
   // Check if an instrument is tracked
   bool isTrackedInstrument(const std::string &name) const;
@@ -92,8 +180,9 @@ public:
   void updateSnapshotChangeNo(int32_t instrumentId, int32_t changeNo);
 
   // Process update
-  void handleUpdateMessage(const UpdateHeader &header,
-                           const std::vector<CachedParsedUpdateEvent> &events);
+  void
+  handleUpdateMessage(const UpdateHeader &header,
+                      const std::pmr::vector<CachedParsedUpdateEvent> &events);
 
   // Check if a specific instrument's VWAP has changed
   bool isVWAPChanged(int32_t instrumentId) const;
@@ -124,9 +213,10 @@ private:
   // Track instruments that were updated in the current frame
   std::unordered_set<int32_t> updatedInstruments;
 
-  // Cache for out-of-sequence or pre-snapshot updates
-  std::unordered_map<int32_t, std::vector<CachedParsedUpdate>>
-      cachedParsedUpdates;
+  // Memory pool for cached updates
+  std::pmr::monotonic_buffer_resource updateResource;
+  std::pmr::unordered_map<int32_t, std::pmr::vector<CachedParsedUpdate>>
+      cachedParsedUpdates{&updateResource};
 
   // Filtered IPs
   uint32_t snapshotIP;

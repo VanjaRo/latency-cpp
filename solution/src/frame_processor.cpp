@@ -1,5 +1,6 @@
 #include "frame_processor.h"
 #include "protocol_logger.h"
+#include <iostream> // For PCAP direct mode output
 
 #include <arpa/inet.h> // For ntohs, ntohl, inet_pton
 #include <chrono>
@@ -572,6 +573,26 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
 // Helper function to write output to the queue
 void FrameProcessor::writeOutput(bool isSnapshotOrError,
                                  uint64_t frameCounter) {
+  if (usePcap_) {
+    // PCAP direct mode: print output to stdout
+    if (isSnapshotOrError) {
+      std::cout << 0 << std::endl;
+    } else {
+      auto updatedInstruments = orderbookManager_.getUpdatedInstruments();
+      if (updatedInstruments.empty()) {
+        std::cout << 0 << std::endl;
+      } else {
+        std::cout << updatedInstruments.size();
+        for (const auto &vwap : updatedInstruments) {
+          std::cout << " " << vwap.instrumentId << " " << vwap.numerator << " "
+                    << vwap.denominator;
+        }
+        std::cout << std::endl;
+      }
+      orderbookManager_.clearChangedVWAPs();
+    }
+    return;
+  }
   const size_t output_size_zero = sizeof(uint32_t);
   const size_t output_size_result_triple = 3 * sizeof(uint32_t);
 

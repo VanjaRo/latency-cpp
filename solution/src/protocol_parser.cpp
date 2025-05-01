@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <memory_resource>
 #include <sstream>
 #include <stdexcept>
 
@@ -413,8 +414,9 @@ void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
 
   size_t offset = 0;
   UpdateHeader currentHeader = {}; // Header for the current group
-  std::vector<CachedParsedUpdateEvent>
-      currentEvents; // Events for the current group
+  // Use PMR vector for update events to allocate in the manager's arena
+  std::pmr::vector<CachedParsedUpdateEvent> currentEvents(
+      manager_.getUpdateResource());
   bool headerParsedForCurrentGroup =
       false; // Flag: have we seen 0x0003 for the current group?
 

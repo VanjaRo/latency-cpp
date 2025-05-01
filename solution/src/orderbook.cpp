@@ -7,19 +7,18 @@
 #include <cstring>
 #include <fstream> // For std::ifstream in loadMetadata
 #include <limits>
-#include <sstream> // For std::istringstream in loadMetadata
-#include <vector>  // For std::vector in cachedParsedUpdates and getChangedVWAPs
+#include <memory_resource> // For pmr::vector
+#include <sstream>         // For std::istringstream in loadMetadata
+#include <vector> // For std::vector in cachedParsedUpdates and getChangedVWAPs
 
 // Orderbook constructor
 Orderbook::Orderbook()
     : instrumentId(0), tickSize(0.0), referencePrice(0.0), changeNo(0),
-      askCount(0), bidCount(0), vwapNumerator(0), vwapDenominator(0),
-      lastVwapNumerator(0), lastVwapDenominator(0), isValid(false),
-      vwapChanged(false) {
-
-  // Reserve some space for efficiency, actual size managed by counts
-  asks.reserve(MAX_PRICE_LEVELS + 5); // Reserve a bit more than needed
-  bids.reserve(MAX_PRICE_LEVELS + 5);
+      vwapNumerator(0), vwapDenominator(0), lastVwapNumerator(0),
+      lastVwapDenominator(0), isValid(false), vwapChanged(false) {
+  // Initialize inline buffers empty
+  asks.clear();
+  bids.clear();
 }
 
 // OrderbookManager constructor
@@ -82,14 +81,11 @@ void OrderbookManager::processSnapshotInfo(const InstrumentInfo &info) {
   orderbook.instrumentId = info.instrumentId;
   orderbook.tickSize = info.tickSize;
   orderbook.referencePrice = info.referencePrice;
-  orderbook.changeNo = -1;  // Initialize changeNo, expecting update later
-  orderbook.isValid = true; // Mark as valid *after* applying snapshot base info
-  orderbook.askCount = 0;   // Clear existing levels
-  orderbook.bidCount = 0;
-  orderbook.asks.clear(); // Clear vectors
+  orderbook.changeNo = -1;
+  orderbook.isValid = true;
+  orderbook.asks.clear();
   orderbook.bids.clear();
-
-  orderbook.vwapChanged = false; // Reset flag
+  orderbook.vwapChanged = false;
 
   // Track ID to name mapping
   idToName[info.instrumentId] = instrName;
@@ -120,19 +116,15 @@ void OrderbookManager::processSnapshotOrderbook(int32_t instrumentId, Side side,
 
   // Snapshot provides only top levels, directly add to vector
   if (side == Side::BID) {
-    if (orderbook.bidCount <
-        MAX_PRICE_LEVELS) { // Respect MAX_PRICE_LEVELS for snapshot
+    if (orderbook.bids.size() < MAX_PRICE_LEVELS) {
       orderbook.bids.push_back({price, static_cast<int64_t>(volume)});
-      orderbook.bidCount++;
     } else {
       LOG_WARN("Snapshot provides more than MAX_PRICE_LEVELS BIDs for id=",
                instrumentId);
     }
   } else { // ASK
-    if (orderbook.askCount <
-        MAX_PRICE_LEVELS) { // Respect MAX_PRICE_LEVELS for snapshot
+    if (orderbook.asks.size() < MAX_PRICE_LEVELS) {
       orderbook.asks.push_back({price, static_cast<int64_t>(volume)});
-      orderbook.askCount++;
     } else {
       LOG_WARN("Snapshot provides more than MAX_PRICE_LEVELS ASKs for id=",
                instrumentId);
@@ -174,8 +166,8 @@ void OrderbookManager::finalizeSnapshot(int32_t instrumentId) {
 
   LOG_DEBUG("Finalizing snapshot application for id=", instrumentId,
             " ChangeNo: ", orderbook.changeNo,
-            " Bid Levels=", orderbook.bidCount,
-            " Ask Levels=", orderbook.askCount);
+            " Bid Levels=", orderbook.bids.size(),
+            " Ask Levels=", orderbook.asks.size());
 
   // Calculate initial VWAP based on the snapshot levels
   //   calculateVWAP(orderbook);
@@ -192,7 +184,7 @@ void OrderbookManager::finalizeSnapshot(int32_t instrumentId) {
              ". This may cause problems with updates.");
   }
 
-  if (orderbook.bidCount == 0 && orderbook.askCount == 0) {
+  if (orderbook.bids.empty() && orderbook.asks.empty()) {
     LOG_WARN("Empty orderbook (no bids or asks) after snapshot for ID ",
              instrumentId);
   }
@@ -329,12 +321,14 @@ void OrderbookManager::applyCachedUpdates(Orderbook &orderbook) {
   if (cachedQueue.empty()) {
     cachedParsedUpdates.erase(cacheIt);
   }
+  // Recycle PMR memory for cached updates after application
+  updateResource.release();
 }
 
 // Process a fully parsed update message (header + events)
 void OrderbookManager::handleUpdateMessage(
     const UpdateHeader &header,
-    const std::vector<CachedParsedUpdateEvent> &events) {
+    const std::pmr::vector<CachedParsedUpdateEvent> &events) {
 
   // Skip processing for untracked instruments
   if (!isTrackedInstrumentId(header.instrumentId)) {
@@ -380,9 +374,9 @@ void OrderbookManager::handleUpdateMessage(
       ob_it->second.isValid = false; // Invalidate book
     }
 
-    // Cache the update for later processing
-    cachedParsedUpdates[header.instrumentId].push_back(
-        {header.changeNo, events});
+    // Cache the update for later processing (use PMR-based CachedParsedUpdate)
+    cachedParsedUpdates[header.instrumentId].emplace_back(
+        header.changeNo, events, &updateResource);
     return;
   }
 
@@ -449,15 +443,15 @@ void OrderbookManager::handleUpdateMessage(
   // Add log for orderbook state after applying events
   LOG_DEBUG("Orderbook state for ID ", orderbook.instrumentId,
             " after applying update ", orderbook.changeNo, ":");
-  LOG_DEBUG("  BidCount: ", orderbook.bidCount,
-            ", AskCount: ", orderbook.askCount);
+  LOG_DEBUG("  BidCount: ", orderbook.bids.size(),
+            ", AskCount: ", orderbook.asks.size());
   LOG_DEBUG("  Bids:");
-  for (int i = 0; i < orderbook.bidCount; ++i) {
+  for (size_t i = 0; i < orderbook.bids.size(); ++i) {
     LOG_DEBUG("    [", i, "] Price=", orderbook.bids[i].price,
               ", Volume=", orderbook.bids[i].volume);
   }
   LOG_DEBUG("  Asks:");
-  for (int i = 0; i < orderbook.askCount; ++i) {
+  for (size_t i = 0; i < orderbook.asks.size(); ++i) {
     LOG_DEBUG("    [", i, "] Price=", orderbook.asks[i].price,
               ", Volume=", orderbook.asks[i].volume);
   }
@@ -476,8 +470,7 @@ void OrderbookManager::addPriceLevel(Orderbook &orderbook, Side side,
             " Side=", (side == Side::BID ? "BID" : "ASK"),
             " Index=", priceLevelIndex, " Price=", price, " Vol=", volume);
 
-  auto &levels = (side == Side::BID) ? orderbook.bids : orderbook.asks;
-  int &count = (side == Side::BID) ? orderbook.bidCount : orderbook.askCount;
+  PriceBuf &buf = (side == Side::BID) ? orderbook.bids : orderbook.asks;
 
   // Validate price level index
   if (priceLevelIndex < 0) {
@@ -486,34 +479,25 @@ void OrderbookManager::addPriceLevel(Orderbook &orderbook, Side side,
     return;
   }
 
-  // Use vector's insert. Handles index > count by effectively appending.
-  // Note: Protocol uses 1-based index, code uses 0-based index.
-  if (priceLevelIndex > count) {
-    // Protocol allows adding beyond current count, treat as append for
-    // simplicity as intermediate levels aren't defined by ADD.
-    LOG_TRACE("Add Level index ", priceLevelIndex, " is beyond current count ",
-              count, ". Appending for ID ", orderbook.instrumentId);
-    levels.push_back({price, volume});
-  } else {
-    // Insert at the specified index
-    levels.insert(levels.begin() + priceLevelIndex, {price, volume});
-  }
-
-  count++; // Increment count regardless of insertion position
+  // Determine insert position (clamp to [0..size])
+  size_t idx = (priceLevelIndex < 0) ? 0 : static_cast<size_t>(priceLevelIndex);
+  if (idx > buf.size())
+    idx = buf.size();
+  buf.insert(idx, PriceLevel{price, volume});
 
   if (orderbook.instrumentId == 2882) {
     LOG_DEBUG("ID 2882 Add Final state after adding level at index ",
               priceLevelIndex, " (Price=", price, ", Volume=", volume, ") for ",
-              (side == Side::BID ? "BID" : "ASK"), ". New count: ", count,
-              ", Vector size: ", levels.size());
+              (side == Side::BID ? "BID" : "ASK"), ". New count: ", buf.size(),
+              ", Vector size: ", buf.size());
     // Log only top levels relevant for VWAP if vector is large
-    int log_limit = std::min((size_t)count, MAX_PRICE_LEVELS + 2);
+    int log_limit = std::min((size_t)buf.size(), MAX_PRICE_LEVELS + 2);
     for (int i = 0; i < log_limit; ++i) {
-      if (i < levels.size()) { // Boundary check
-        LOG_DEBUG("  Level[", i, "]: Price=", levels[i].price,
-                  ", Volume=", levels[i].volume);
+      if (i < buf.size()) { // Boundary check
+        LOG_DEBUG("  Level[", i, "]: Price=", buf[i].price,
+                  ", Volume=", buf[i].volume);
       } else {
-        LOG_DEBUG("  Level[", i, "]: Index out of bounds (size=", levels.size(),
+        LOG_DEBUG("  Level[", i, "]: Index out of bounds (size=", buf.size(),
                   ")");
       }
     }
@@ -528,17 +512,7 @@ void OrderbookManager::modifyPriceLevel(Orderbook &orderbook, Side side,
             " Side=", (side == Side::BID ? "BID" : "ASK"),
             " Index=", priceLevelIndex, " Price=", price, " Vol=", volume);
 
-  auto &levels = (side == Side::BID) ? orderbook.bids : orderbook.asks;
-  int &count = (side == Side::BID) ? orderbook.bidCount : orderbook.askCount;
-
-  // Protocol guarantees volume != 0 for modifications
-  if (volume <= 0) {
-    LOG_WARN("Invalid volume (", volume, ") for MODIFY operation in ID ",
-             orderbook.instrumentId, ". Should be > 0.");
-    // Keep the original level if volume is invalid? Or treat as delete?
-    // For now, just log and proceed, maybe overwriting price but keeping
-    // volume? Let's overwrite both.
-  }
+  PriceBuf &buf = (side == Side::BID) ? orderbook.bids : orderbook.asks;
 
   // Validate price level index
   if (priceLevelIndex < 0) {
@@ -547,37 +521,25 @@ void OrderbookManager::modifyPriceLevel(Orderbook &orderbook, Side side,
     return;
   }
 
-  // If the index is beyond the current count, protocol implies this shouldn't
-  // happen for MODIFY. But if it does, treat as ADD?
-  if (priceLevelIndex >= count) {
-    LOG_WARN("Modify level index ", priceLevelIndex,
-             " out of bounds (Count=", count, "). Treating as ADD for ID ",
-             orderbook.instrumentId);
-    if (priceLevelIndex == count) { // Append if exactly at the end
-      levels.push_back({price, volume});
-      count++;
-    } else { // Cannot directly modify beyond end, maybe push back?
-      levels.push_back({price, volume}); // Append, index becomes count
-      count++;
-    }
-
+  // If index beyond end, treat as add
+  if (static_cast<size_t>(priceLevelIndex) >= buf.size()) {
+    addPriceLevel(orderbook, side, priceLevelIndex, price, volume);
   } else {
-    // Modify the existing level
-    levels[priceLevelIndex] = {price, volume};
+    buf[priceLevelIndex] = {price, volume};
   }
 
   if (orderbook.instrumentId == 2882) {
     LOG_DEBUG("ID 2882 Modify Final state after modifying level at index ",
               priceLevelIndex, " (Price=", price, ", Volume=", volume, ") for ",
-              (side == Side::BID ? "BID" : "ASK"), ". New count: ", count,
-              ", Vector size: ", levels.size());
-    int log_limit = std::min((size_t)count, MAX_PRICE_LEVELS + 2);
+              (side == Side::BID ? "BID" : "ASK"), ". New count: ", buf.size(),
+              ", Vector size: ", buf.size());
+    int log_limit = std::min((size_t)buf.size(), MAX_PRICE_LEVELS + 2);
     for (int i = 0; i < log_limit; ++i) {
-      if (i < levels.size()) { // Boundary check
-        LOG_DEBUG("  Level[", i, "]: Price=", levels[i].price,
-                  ", Volume=", levels[i].volume);
+      if (i < buf.size()) { // Boundary check
+        LOG_DEBUG("  Level[", i, "]: Price=", buf[i].price,
+                  ", Volume=", buf[i].volume);
       } else {
-        LOG_DEBUG("  Level[", i, "]: Index out of bounds (size=", levels.size(),
+        LOG_DEBUG("  Level[", i, "]: Index out of bounds (size=", buf.size(),
                   ")");
       }
     }
@@ -588,7 +550,8 @@ void OrderbookManager::modifyPriceLevel(Orderbook &orderbook, Side side,
 PriceLevel OrderbookManager::inferMissingLevel(const Orderbook &orderbook,
                                                Side side) {
   const auto &levels = (side == Side::BID) ? orderbook.bids : orderbook.asks;
-  int count = (side == Side::BID) ? orderbook.bidCount : orderbook.askCount;
+  int count =
+      (side == Side::BID) ? orderbook.bids.size() : orderbook.asks.size();
 
   // Default in case we can't infer
   PriceLevel result = {0.0, 0};
@@ -659,38 +622,35 @@ void OrderbookManager::deletePriceLevel(Orderbook &orderbook, Side side,
             " Side=", (side == Side::BID ? "BID" : "ASK"),
             " Index=", priceLevelIndex);
 
-  auto &levels = (side == Side::BID) ? orderbook.bids : orderbook.asks;
-  int &count = (side == Side::BID) ? orderbook.bidCount : orderbook.askCount;
+  PriceBuf &buf = (side == Side::BID) ? orderbook.bids : orderbook.asks;
 
   // Validate index boundaries
-  if (priceLevelIndex < 0 || priceLevelIndex >= count) {
+  if (priceLevelIndex < 0 ||
+      static_cast<size_t>(priceLevelIndex) >= buf.size()) {
     LOG_WARN("Delete level index out of bounds: Index=", priceLevelIndex,
-             " Count=", count, " for ID ", orderbook.instrumentId,
-             ". Skipping.");
+             " for ID ", orderbook.instrumentId, ". Skipping.");
     return;
   }
 
-  // Erase the element from the vector
-  levels.erase(levels.begin() + priceLevelIndex);
-  count--; // Decrement count
+  buf.erase(priceLevelIndex);
 
   // Add extra debug logging to understand the state right after the delete
   // operation
   LOG_TRACE("After deletion for ID ", orderbook.instrumentId,
             " Side=", (side == Side::BID ? "BID" : "ASK"),
-            " Index=", priceLevelIndex, " New Count=", count);
+            " Index=", priceLevelIndex, " New Count=", buf.size());
 
   if (orderbook.instrumentId == 2882) {
     LOG_DEBUG("ID 2882 Delete Final state for ",
-              (side == Side::BID ? "BID" : "ASK"), ". New count: ", count,
-              ", Vector size: ", levels.size());
-    int log_limit = std::min((size_t)count, MAX_PRICE_LEVELS + 2);
+              (side == Side::BID ? "BID" : "ASK"), ". New count: ", buf.size(),
+              ", Vector size: ", buf.size());
+    int log_limit = std::min((size_t)buf.size(), MAX_PRICE_LEVELS + 2);
     for (int i = 0; i < log_limit; ++i) {
-      if (i < levels.size()) { // Boundary check
-        LOG_DEBUG("  Level[", i, "]: Price=", levels[i].price,
-                  ", Volume=", levels[i].volume);
+      if (i < buf.size()) { // Boundary check
+        LOG_DEBUG("  Level[", i, "]: Price=", buf[i].price,
+                  ", Volume=", buf[i].volume);
       } else {
-        LOG_DEBUG("  Level[", i, "]: Index out of bounds (size=", levels.size(),
+        LOG_DEBUG("  Level[", i, "]: Index out of bounds (size=", buf.size(),
                   ")");
       }
     }
@@ -749,17 +709,17 @@ void OrderbookManager::calculateVWAP(Orderbook &orderbook) {
 
   // Log the current state of the orderbook
   LOG_TRACE("Current orderbook state for ID ", orderbook.instrumentId,
-            " - BidCount: ", orderbook.bidCount,
-            ", AskCount: ", orderbook.askCount,
+            " - BidCount: ", orderbook.bids.size(),
+            ", AskCount: ", orderbook.asks.size(),
             ", TickSize: ", orderbook.tickSize,
             ", Bid vector size: ", orderbook.bids.size(),
             ", Ask vector size: ", orderbook.asks.size());
 
   // Determine number of levels to consider for VWAP (top MAX_PRICE_LEVELS)
   size_t bidLevelsToConsider =
-      std::min((size_t)orderbook.bidCount, MAX_PRICE_LEVELS);
+      std::min((size_t)orderbook.bids.size(), MAX_PRICE_LEVELS);
   size_t askLevelsToConsider =
-      std::min((size_t)orderbook.askCount, MAX_PRICE_LEVELS);
+      std::min((size_t)orderbook.asks.size(), MAX_PRICE_LEVELS);
 
   // Detailed check for zero or negative volume/price entries within considered
   // levels
@@ -915,7 +875,8 @@ OrderbookManager::getValidOrderbooks() const {
     const auto &orderbook = pair.second;
 
     // Report all valid orderbooks with both bids and asks
-    if (orderbook.isValid && orderbook.askCount > 0 && orderbook.bidCount > 0 &&
+    if (orderbook.isValid && !orderbook.asks.empty() &&
+        !orderbook.bids.empty() &&
         orderbook.vwapDenominator >
             0) { // Ensure we don't report zero-denominator VWAPs
 
@@ -930,8 +891,8 @@ OrderbookManager::getValidOrderbooks() const {
       // Log skipped orderbooks for debugging
       LOG_TRACE("Orderbook for ID ", orderbook.instrumentId,
                 " not reported: isValid=", orderbook.isValid,
-                ", askCount=", orderbook.askCount,
-                ", bidCount=", orderbook.bidCount,
+                ", askCount=", orderbook.asks.size(),
+                ", bidCount=", orderbook.bids.size(),
                 ", denominator=", orderbook.vwapDenominator);
     }
   }
@@ -966,6 +927,10 @@ void OrderbookManager::loadInstruments(
   }
   LOG_INFO("OrderbookManager loaded ", trackedInstruments.size(),
            " instruments for tracking.");
+  // Reset and reserve the PMR pool for cached updates
+  updateResource.release();
+  cachedParsedUpdates.clear();
+  cachedParsedUpdates.reserve(trackedInstruments.size());
 }
 
 // Update change number from snapshot's trading session info
@@ -1017,8 +982,8 @@ OrderbookManager::getUpdatedInstruments() const {
 
       // Only report instruments that have valid orderbooks with both bids and
       // asks AND whose VWAP has changed
-      if (orderbook.isValid && orderbook.askCount > 0 &&
-          orderbook.bidCount > 0 && orderbook.vwapDenominator > 0 &&
+      if (orderbook.isValid && !orderbook.asks.empty() &&
+          !orderbook.bids.empty() && orderbook.vwapDenominator > 0 &&
           orderbook.vwapChanged) {
 
         LOG_DEBUG("Reporting VWAP for updated ID ", orderbook.instrumentId,
@@ -1032,8 +997,8 @@ OrderbookManager::getUpdatedInstruments() const {
         // Log skipped orderbooks for debugging
         LOG_TRACE("Updated orderbook for ID ", orderbook.instrumentId,
                   " not reported: isValid=", orderbook.isValid,
-                  ", askCount=", orderbook.askCount,
-                  ", bidCount=", orderbook.bidCount,
+                  ", askCount=", orderbook.asks.size(),
+                  ", bidCount=", orderbook.bids.size(),
                   ", denominator=", orderbook.vwapDenominator);
       }
     }
