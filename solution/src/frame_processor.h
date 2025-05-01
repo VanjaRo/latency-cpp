@@ -91,6 +91,13 @@ public:
   void run();
 
 private:
+  // Backoff parameters for busy-wait loops
+  static constexpr int BACKOFF_SPIN_LIMIT = 50;
+  static constexpr int BACKOFF_YIELD_LIMIT = 200;
+
+  // Helper to apply unified spin/yield/sleep backoff
+  static void backoffDelay(int &counter);
+
   // --- Helper Struct for Parsed Packet Data ---
   struct PacketInfo {
     bool valid =

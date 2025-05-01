@@ -5,8 +5,9 @@ set -euo pipefail
 
 USE_LIGHTPCAPNG=OFF
 LOG_LEVEL="NONE"
-BUILD_TYPE="Debug"
+BUILD_TYPE="Release"
 ENABLE_ASAN="ON"
+LOG_LEVEL_SET="OFF"
 
 VALID_LOG_LEVELS=("NONE" "ERROR" "WARN" "INFO" "DEBUG" "TRACE")
 VALID_BUILD_TYPES=("Debug" "Release")
@@ -44,6 +45,7 @@ while [[ $# -gt 0 ]]; do
     --log-level)
       if [[ -n "$2" && ! "$2" =~ ^-- ]]; then
           if is_valid_log_level "$2"; then
+              LOG_LEVEL_SET="ON"
               LOG_LEVEL="$2"
               shift 2
           else
@@ -85,6 +87,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Override build type based on presence of --log-level
+if [[ "$LOG_LEVEL_SET" == "ON" ]]; then
+    BUILD_TYPE="Debug"
+else
+    BUILD_TYPE="Release"
+fi
+
 SOLUTION_DIR="$(pwd)/solution"
 BUILD_DIR="${SOLUTION_DIR}/build_${BUILD_TYPE,,}"
 BIN_DIR="${BUILD_DIR}/bin"
@@ -94,6 +103,7 @@ cd "${BUILD_DIR}"
 
 cmake "${SOLUTION_DIR}" \
     -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+    -DCMAKE_CXX_FLAGS_RELEASE="-O3 -march=native -flto -funroll-loops" \
     -DUSE_LIGHTPCAPNG=${USE_LIGHTPCAPNG} \
     -DCMAKE_LOG_LEVEL=${LOG_LEVEL} \
     -DENABLE_ASAN=${ENABLE_ASAN}

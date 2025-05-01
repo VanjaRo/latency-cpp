@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring> // For memcpy
 #include <fstream>
+#include <immintrin.h>
 #include <netinet/if_ether.h> // Include for ETHERTYPE_IP
 #include <sstream>
 #include <stdexcept>
@@ -195,15 +196,6 @@ bool FrameProcessor::waitForBytes(size_t requiredBytes, uint64_t frameCounter,
     uint32_t current_consumer =
         inputQueue_->header->consumer_offset.load(std::memory_order_acquire);
 
-    // Double check relationship between producer and consumer offsets
-    if (current_consumer > current_producer) {
-      LOG_ERROR("[Frame ", frameCounter, "] [", waitReason,
-                " WAIT ERROR] Consumer offset (", current_consumer,
-                ") ahead of producer offset (", current_producer,
-                "). Queue corrupted!");
-      return false; // Signal error condition
-    }
-
     // Get readable bytes after verification
     readableBytes = inputQueue_->getReadableBytes();
 
@@ -229,8 +221,8 @@ bool FrameProcessor::waitForBytes(size_t requiredBytes, uint64_t frameCounter,
                 readableBytes, " (Prod: ", current_producer,
                 ", Cons: ", current_consumer, ")");
     }
-    wait_count++;
-    std::this_thread::sleep_for(std::chrono::microseconds(10));
+    // unified backoff
+    backoffDelay(wait_count);
 
   } // --- End while(true) ---
 
@@ -244,6 +236,18 @@ bool FrameProcessor::waitForBytes(size_t requiredBytes, uint64_t frameCounter,
             readableBytes, ", Prod: ", final_producer,
             ", Cons: ", final_consumer, ").");
   return true; // Success
+}
+
+// Helper to apply unified spin/yield/sleep backoff
+void FrameProcessor::backoffDelay(int &counter) {
+  if (counter < BACKOFF_SPIN_LIMIT) {
+    _mm_pause();
+  } else if (counter < BACKOFF_YIELD_LIMIT) {
+    std::this_thread::yield();
+  } else {
+    std::this_thread::sleep_for(std::chrono::microseconds(1));
+  }
+  ++counter;
 }
 
 // Helper function to parse the next packet from the input queue
@@ -273,8 +277,8 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
       return info;
     }
 
-    // Short sleep before retry
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // unified backoff before retrying
+    backoffDelay(retry_count);
   }
 
   info.bytesAvailableWhenParsed =
@@ -344,8 +348,8 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
       return info;
     }
 
-    // Short sleep before retry
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // unified backoff before retrying
+    backoffDelay(retry_count);
   }
 
   info.bytesAvailableWhenParsed = inputQueue_->getReadableBytes();
@@ -441,8 +445,8 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
       return info;
     }
 
-    // Short sleep before retry
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // unified backoff before retrying
+    backoffDelay(retry_count);
   }
 
   info.bytesAvailableWhenParsed = inputQueue_->getReadableBytes();
@@ -586,8 +590,8 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
                  "] Waiting to write 0 to output queue... (Prod:", prod,
                  " Cons:", cons, ")");
       }
-      wait_cycles++;
-      std::this_thread::sleep_for(std::chrono::microseconds(5));
+      // unified backoff
+      backoffDelay(wait_cycles);
     }
     LOG_DEBUG("[Frame ", frameCounter,
               "] Output queue has space for 0. Writing...");
@@ -616,8 +620,8 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
                    "queue... (Prod:",
                    prod, " Cons:", cons, ")");
         }
-        wait_cycles++;
-        std::this_thread::sleep_for(std::chrono::microseconds(5));
+        // unified backoff
+        backoffDelay(wait_cycles);
       }
       LOG_DEBUG("[Frame ", frameCounter,
                 "] Output queue has space for 0 (no updated instruments). "
@@ -648,8 +652,8 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
                    " bytes) to output queue... (Prod:", prod, " Cons:", cons,
                    ")");
         }
-        wait_cycles++;
-        std::this_thread::sleep_for(std::chrono::microseconds(5));
+        // unified backoff
+        backoffDelay(wait_cycles);
       }
       LOG_TRACE("[Frame ", frameCounter, "] Output queue has space for ",
                 updatedInstruments.size(), " VWAPs. Writing...");

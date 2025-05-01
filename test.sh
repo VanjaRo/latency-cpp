@@ -1,10 +1,13 @@
 #!/bin/bash
 # Local test script for latency challenge
-# Usage: ./test.sh [--pcap-direct|--shm] [--file=public1|--file=public2]
+# Usage: ./test.sh [--pcap-direct|--shm] [--file=public1|--file=public2] [--release] [--hugetables]
 
 set -e
 
-SOLUTION_BIN="./solution/build_debug/solution"
+# Default to debug build unless --release is passed
+BUILD_TYPE="debug"
+# Default to disabling hugepages unless --hugetables is passed
+USE_HUGEPAGES="false"
 DATA_DIR="./lat-spring-data"
 RESULTS_DIR="./results"
 
@@ -13,6 +16,14 @@ PCAP_FILE="all"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
+    --release)
+      BUILD_TYPE="release"
+      shift
+      ;;
+    --hugetables)
+      USE_HUGEPAGES="true"
+      shift
+      ;;
     --pcap-direct)
       TEST_MODE="pcap-direct"
       shift
@@ -31,11 +42,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: $0 [--pcap-direct|--shm] [--file=public1|--file=public2]"
+      echo "Usage: $0 [--pcap-direct|--shm] [--file=public1|--file=public2] [--release] [--hugetables]"
       exit 1
       ;;
   esac
 done
+
+# Determine the solution binary based on build type
+SOLUTION_BIN="./solution/build_${BUILD_TYPE}/solution"
 
 if [ ! -x "${SOLUTION_BIN}" ]; then
     echo "Error: Solution binary not found or not executable at ${SOLUTION_BIN}"
@@ -69,16 +83,22 @@ run_shm_test() {
       return
   fi
 
-  BUFFER_PREFIX="test_buffer_runner_${file}_no_huge"
+  BUFFER_PREFIX="test_buffer_runner_${file}"
   local runner_cmd=(
       "${runner_bin}"
       -sol "${SOLUTION_BIN}"
       -meta "${meta_path}"
       -b "${BUFFER_PREFIX}"
-      -disable-hugepages
       -o "${runner_another_log_path}"
-      "${pcap_path}"
   )
+
+  # Disable hugepages only if --hugetables flag was NOT provided
+  if [[ "$USE_HUGEPAGES" == "false" ]]; then
+    runner_cmd+=("-disable-hugepages")
+    BUFFER_PREFIX+="_no_huge"
+  fi
+  
+  runner_cmd+=("${pcap_path}")
 
   export LSAN_OPTIONS="verbosity=1:log_threads=1"
   if "${runner_cmd[@]}" > "${runner_log_path}" 2>&1; then

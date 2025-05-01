@@ -3,6 +3,17 @@
 #include <cstring>
 #include <stdexcept>
 #include <sys/stat.h> // Include for stat
+#if defined(__linux__)
+#include <sys/statfs.h> // for fstatfs and struct statfs on Linux
+#elif defined(__APPLE__)
+#include <sys/mount.h> // for statfs and struct statfs on macOS
+#endif
+
+// HUGETLBFS_MAGIC filesystem magic for hugetlbfs (defined here in case
+// <linux/magic.h> is unavailable)
+#ifndef HUGETLBFS_MAGIC
+#define HUGETLBFS_MAGIC 0x958458f6UL
+#endif
 
 SharedQueue::SharedQueue(const std::string &headerPath,
                          const std::string &bufferPath, size_t bufferSize,
@@ -24,33 +35,49 @@ SharedQueue::SharedQueue(const std::string &headerPath,
                              " (" + strerror(errno) + ")");
   }
 
-  // Memory map the header
+  // Map header file
   header = static_cast<SPSCHeader *>(mmap(nullptr, sizeof(SPSCHeader),
                                           PROT_READ | PROT_WRITE, MAP_SHARED,
                                           headerFd, 0));
-
   if (header == MAP_FAILED) {
-    close(headerFd);
     close(bufferFd);
-    throw std::runtime_error("Failed to mmap header file (" +
-                             std::string(strerror(errno)) + ")");
+    close(headerFd);
+    throw std::runtime_error("Failed to mmap header file: " + headerPath +
+                             " (" + strerror(errno) + ")");
   }
 
-  // Check if hugepages are being used
-  int mmap_flags = MAP_SHARED | MAP_FIXED;
-  if (bufferPath.rfind("/dev/hugepages/", 0) == 0) {
-#ifdef MAP_HUGETLB // Check if MAP_HUGETLB is defined
-    mmap_flags |= MAP_HUGETLB;
-#else
-    // Handle case where MAP_HUGETLB is not available if necessary
-    // For now, we might just proceed without it or throw an error
-    // Let's proceed without it for now, maybe log a warning later if needed.
+  // Detect whether buffer file resides on hugetlbfs (i.e. hugepages pool)
+  bool useHuge = false;
+  struct statfs fsinfo;
+  if (fstatfs(bufferFd, &fsinfo) == 0 &&
+      static_cast<unsigned long>(fsinfo.f_type) == HUGETLBFS_MAGIC) {
+    useHuge = true;
+  }
+
+  // Flags for mapping the buffer file into each half
+  // MAP_HUGETLB ensures kernel uses 2 MiB pages when mapping hugetlbfs files
+  int file_mmap_flags = MAP_SHARED | MAP_FIXED;
+  if (useHuge) {
+#ifdef MAP_HUGETLB
+    file_mmap_flags |= MAP_HUGETLB;
 #endif
   }
 
   // Create anonymous mapping for double buffer size
-  uint8_t *base_ptr = static_cast<uint8_t *>(mmap(
-      nullptr, bufferSize * 2, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  // When using hugetlbfs, include MAP_HUGETLB and MAP_POPULATE on anon to get
+  // a 2 MiB-aligned, prefaulted region; otherwise simple anonymous mapping
+  int anon_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+  if (useHuge) {
+#ifdef MAP_HUGETLB
+    anon_flags |= MAP_HUGETLB; // align anon region to hugepage boundary
+#endif
+#ifdef MAP_POPULATE
+    anon_flags |= MAP_POPULATE; // prefault hugepages in anon mapping
+#endif
+  }
+
+  uint8_t *base_ptr = static_cast<uint8_t *>(
+      mmap(nullptr, bufferSize * 2, PROT_NONE, anon_flags, -1, 0));
   if (base_ptr == MAP_FAILED) {
     munmap(header, sizeof(SPSCHeader));
     close(headerFd);
@@ -59,9 +86,10 @@ SharedQueue::SharedQueue(const std::string &headerPath,
                              std::string(strerror(errno)) + ")");
   }
 
-  // Map the buffer file into the first half
-  buffer = static_cast<uint8_t *>(mmap(
-      base_ptr, bufferSize, PROT_READ | PROT_WRITE, mmap_flags, bufferFd, 0));
+  // Map the buffer file into the first half using fixed mapping
+  buffer =
+      static_cast<uint8_t *>(mmap(base_ptr, bufferSize, PROT_READ | PROT_WRITE,
+                                  file_mmap_flags, bufferFd, 0));
   if (buffer != base_ptr) {           // Check if MAP_FIXED worked
     munmap(base_ptr, bufferSize * 2); // Clean up anonymous mapping
     munmap(header, sizeof(SPSCHeader));
@@ -74,7 +102,7 @@ SharedQueue::SharedQueue(const std::string &headerPath,
   // Map the buffer file into the second half
   uint8_t *second_half_ptr = static_cast<uint8_t *>(
       mmap(base_ptr + bufferSize, bufferSize, PROT_READ | PROT_WRITE,
-           mmap_flags, bufferFd, 0));
+           file_mmap_flags, bufferFd, 0));
 
   if (second_half_ptr != base_ptr + bufferSize) { // Check if MAP_FIXED worked
     munmap(buffer, bufferSize);                   // Clean up first half mapping
@@ -85,6 +113,11 @@ SharedQueue::SharedQueue(const std::string &headerPath,
     throw std::runtime_error("Failed to mmap buffer file into second half (" +
                              std::string(strerror(errno)) + ")");
   }
+
+  // Advise the kernel to group pages into hugepages for this mapping region
+#ifdef MADV_HUGEPAGE
+  madvise(buffer, bufferSize * 2, MADV_HUGEPAGE);
+#endif
 }
 
 SharedQueue::~SharedQueue() {
