@@ -6,7 +6,7 @@ set -euo pipefail
 USE_LIGHTPCAPNG=OFF
 LOG_LEVEL="NONE"
 BUILD_TYPE="Release"
-ENABLE_ASAN="ON"
+ENABLE_ASAN="OFF"
 LOG_LEVEL_SET="OFF"
 
 VALID_LOG_LEVELS=("NONE" "ERROR" "WARN" "INFO" "DEBUG" "TRACE")
@@ -96,7 +96,6 @@ fi
 
 SOLUTION_DIR="$(pwd)/solution"
 BUILD_DIR="${SOLUTION_DIR}/build_${BUILD_TYPE,,}"
-BIN_DIR="${BUILD_DIR}/bin"
 
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
@@ -111,8 +110,10 @@ cmake "${SOLUTION_DIR}" \
 NPROC=$(nproc 2>/dev/null || echo 1)
 make -j${NPROC}
 
-echo "--- Binaries located in ${BIN_DIR} ---"
 cd ../..
+
+# Copy the built solution executable into the solution source directory for CI
+cp "${BUILD_DIR}/solution" "${SOLUTION_DIR}"
 
 echo "=== Local build completed successfully! ==="
 if [ "${USE_LIGHTPCAPNG}" = "ON" ]; then
