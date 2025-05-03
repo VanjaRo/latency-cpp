@@ -94,7 +94,7 @@ else
     BUILD_TYPE="Release"
 fi
 
-SOLUTION_DIR="$(pwd)/solution"
+SOLUTION_DIR="$(pwd)/trading-data-listener"
 BUILD_DIR="${SOLUTION_DIR}/build_${BUILD_TYPE,,}"
 
 mkdir -p "${BUILD_DIR}"
@@ -112,9 +112,9 @@ make -j${NPROC}
 
 cd ../..
 
-# Copy the built solution executable into the solution source directory for CI
-cp -p "${BUILD_DIR}/solution" "${SOLUTION_DIR}"
-chmod +x "${SOLUTION_DIR}/solution"
+
+cp "${BUILD_DIR}/solution" .
+chmod +x solution
 
 echo "=== Local build completed successfully! ==="
 if [ "${USE_LIGHTPCAPNG}" = "ON" ]; then
