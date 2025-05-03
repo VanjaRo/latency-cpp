@@ -233,31 +233,57 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
   dumpHexBytes(data, std::min(size, static_cast<size_t>(32)),
                "Beginning of snapshot content");
 
+  // Bulk skip of known snapshot prefix: six fixed non-instrument fields
   size_t offset = 0;
-  int32_t currentInstrumentId = -1;
-
-  while (offset + sizeof(FieldHeader) <= size) {
-    // Read FieldHeader directly via pointer for speed (no memcpy)
-    const FieldHeader *localHeader =
-        getFieldPtr<FieldHeader>(data, offset, size);
-    // Check for complete field availability
-    if (offset + sizeof(FieldHeader) + localHeader->fieldLen > size) {
-      LOG_ERROR("Incomplete field data at offset ", offset,
-                ". Field id=", std::hex, localHeader->fieldId, std::dec,
-                " Declared Length=", localHeader->fieldLen,
-                " Remaining Size=", (size - offset - sizeof(FieldHeader)));
-      return; // Stop processing this message
+  {
+    // Snapshot prefix: field_ids = {0x0032,0x0031,0x1001,0x1003,0x1002,0x1004}
+    // lengths = {9,22,6,37,22,4}
+    static constexpr size_t PREFIX_FIELDS = 6;
+    static constexpr uint16_t prefixIds[PREFIX_FIELDS] = {
+        0x0032, 0x0031, 0x1001, 0x1003, 0x1002, 0x1004};
+    static constexpr uint16_t prefixLens[PREFIX_FIELDS] = {9, 22, 6, 37, 22, 4};
+    static constexpr size_t SNAPSHOT_PREFIX_SIZE =
+        PREFIX_FIELDS * sizeof(FieldHeader) + (9 + 22 + 6 + 37 + 22 + 4);
+    if (size >= SNAPSHOT_PREFIX_SIZE) {
+      size_t tmpOff = 0;
+      bool match = true;
+      for (size_t i = 0; i < PREFIX_FIELDS; ++i) {
+        const FieldHeader *h = getFieldPtr<FieldHeader>(data, tmpOff, size);
+        if (h->fieldId != prefixIds[i] || h->fieldLen != prefixLens[i]) {
+          match = false;
+          break;
+        }
+        tmpOff += sizeof(FieldHeader) + h->fieldLen;
+      }
+      if (match) {
+        LOG_TRACE(
+            "Fast-forwarded past known snapshot prefix: skipped %zu bytes",
+            tmpOff);
+        offset = tmpOff;
+      }
     }
-    // Proceed with parsed header
-    const uint8_t *fieldData = data + offset + sizeof(FieldHeader);
-    const size_t fieldSize = localHeader->fieldLen;
-    SnapshotFieldId fieldId =
-        static_cast<SnapshotFieldId>(localHeader->fieldId);
+  }
+  int32_t currentInstrumentId = -1;
+  // Pointer-driven field parsing
+  const uint8_t *ptr = data + offset;
+  const uint8_t *end = data + size;
+  while (ptr + sizeof(FieldHeader) <= end) {
+    // Read and validate header
+    FieldHeader hdr;
+    std::memcpy(&hdr, ptr, sizeof(hdr));
+    ptr += sizeof(hdr);
+    if (ptr + hdr.fieldLen > end) {
+      LOG_ERROR(
+          "Incomplete field data in snapshot parse: FieldId=", hdr.fieldId,
+          " Declared Length=", hdr.fieldLen, " Remaining Bytes=", (end - ptr));
+      return;
+    }
+    const uint8_t *fieldData = ptr;
+    size_t fieldSize = hdr.fieldLen;
+    SnapshotFieldId fieldId = static_cast<SnapshotFieldId>(hdr.fieldId);
 
     LOG_TRACE("Processing snapshot field ", std::hex,
-              static_cast<int>(localHeader->fieldId), " size=", std::dec,
-              localHeader->fieldLen);
-
+              static_cast<int>(hdr.fieldId), " size=", std::dec, fieldSize);
     bool processNext = true;
     switch (fieldId) {
     case SnapshotFieldId::INSTRUMENT_INFO: {
@@ -365,16 +391,15 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
     if (!processNext) {
       LOG_ERROR("Stopping snapshot message processing due to error in field ",
                 std::hex, static_cast<int>(fieldId), std::dec);
-      return; // Stop processing this message entirely
+      return;
     }
 
-    // Advance offset to the next field
-    offset += sizeof(FieldHeader) + fieldSize;
+    ptr += fieldSize;
   }
 
-  if (offset != size) {
+  if (ptr != end) {
     LOG_WARN("Extra data remaining at the end of snapshot message: ",
-             (size - offset), " bytes.");
+             (end - ptr), " bytes.");
   }
 
   // Finalize the *last* instrument seen in the message
@@ -390,8 +415,8 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
   } else {
     LOG_DEBUG("End of snapshot message. No active instrument to finalize.");
   }
-  LOG_DEBUG("--- Finished parsing snapshot message, processed ", offset, " of ",
-            size, " bytes ---");
+  LOG_DEBUG("--- Finished parsing snapshot message, processed ", size,
+            " bytes ---");
 }
 
 void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
@@ -403,33 +428,39 @@ void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
   dumpHexBytes(data, std::min(size, static_cast<size_t>(32)),
                "Beginning of update content");
 
-  size_t offset = 0;
-  UpdateHeader currentHeader = {}; // Header for the current group
-  // Use PMR vector for update events to allocate in the manager's arena
+  // Pointer-driven parsing
+  const uint8_t *ptr = data;
+  const uint8_t *end = data + size;
+  UpdateHeader currentHeader = {};
   std::pmr::vector<CachedParsedUpdateEvent> currentEvents(
       manager_.getUpdateResource());
-  bool headerParsedForCurrentGroup =
-      false; // Flag: have we seen 0x0003 for the current group?
+  bool headerParsedForCurrentGroup = false;
 
-  while (offset + sizeof(FieldHeader) <= size) {
-    // Read FieldHeader directly via pointer for speed (no memcpy)
-    const FieldHeader *localHeader =
-        getFieldPtr<FieldHeader>(data, offset, size);
-    // Validate field length against available data
-    if (offset + sizeof(FieldHeader) + localHeader->fieldLen > size) {
-      LOG_ERROR("Incomplete field data at offset ", offset,
-                ". Field id=", std::hex, localHeader->fieldId, std::dec,
-                " Declared Length=", localHeader->fieldLen,
-                " Remaining Size=", (size - offset - sizeof(FieldHeader)));
-      return; // Stop processing this message
+  while (ptr + sizeof(FieldHeader) <= end) {
+    // Read the field header
+    FieldHeader hdr;
+    std::memcpy(&hdr, ptr, sizeof(hdr));
+    ptr += sizeof(hdr);
+    if (ptr + hdr.fieldLen > end) {
+      LOG_ERROR("Incomplete update field: FieldId=", hdr.fieldId,
+                " Declared Length=", hdr.fieldLen,
+                " Remaining Bytes=", (end - ptr));
+      return;
     }
-    // Extract field payload pointer and size
-    const uint8_t *fieldData = data + offset + sizeof(FieldHeader);
-    size_t fieldSize = localHeader->fieldLen;
-    UpdateFieldId fieldId = static_cast<UpdateFieldId>(localHeader->fieldId);
+    const uint8_t *fieldData = ptr;
+    size_t fieldSize = hdr.fieldLen;
+    UpdateFieldId fieldId = static_cast<UpdateFieldId>(hdr.fieldId);
     LOG_TRACE("Processing update field ", std::hex,
-              static_cast<int>(localHeader->fieldId), " size=", std::dec,
-              localHeader->fieldLen);
+              static_cast<int>(hdr.fieldId), " size=", std::dec, fieldSize);
+
+    // Bulk-skip summary fields
+    if (fieldId > UpdateFieldId::UPDATE_ENTRY &&
+        fieldId <= UpdateFieldId::SUMMARY_1016) {
+      LOG_TRACE("Skipping summary update field: ", std::hex,
+                static_cast<int>(fieldId), std::dec);
+      ptr += fieldSize;
+      continue;
+    }
 
     bool processNext = true;
     switch (fieldId) {
@@ -441,11 +472,10 @@ void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
         if (manager_.isTrackedInstrumentId(currentHeader.instrumentId)) {
           manager_.handleUpdateMessage(currentHeader, currentEvents);
         } else {
-          LOG_TRACE(
-              "Skipping handling of previous update group for untracked id=",
-              currentHeader.instrumentId);
+          LOG_TRACE("Skipping previous update group for untracked id=",
+                    currentHeader.instrumentId);
         }
-        currentEvents.clear(); // Reset for the new group regardless
+        currentEvents.clear();
       }
 
       // Parse the new header
@@ -466,144 +496,83 @@ void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
           "Parsed update header: instrumentId=", currentHeader.instrumentId,
           " changeNo=", currentHeader.changeNo);
 
-      // Mark that we have a header for the *next* set of events
       headerParsedForCurrentGroup = true;
-
-      // Check if VInt decoding consumed exactly fieldSize (optional, for
-      // sanity)
-      if (headerFieldOffset != fieldSize) {
-        LOG_TRACE("VInt decoding for update header consumed ",
-                  headerFieldOffset, " bytes, but fieldLen was ", fieldSize,
-                  ". Header likely valid.");
-      }
-      break; // Continue parsing fields
+      break;
     }
 
     case UpdateFieldId::UPDATE_ENTRY: { // 0x1001
       if (!headerParsedForCurrentGroup) {
-        LOG_WARN("Skipping update entry field (0x1001) without a preceding "
-                 "valid header (0x0003)");
-        break; // Skip this field, maybe the next one is a header
+        LOG_WARN("Skipping update entry without header");
+        break;
       }
-      // Only parse/cache events for tracked instruments
       if (!manager_.isTrackedInstrumentId(currentHeader.instrumentId)) {
-        LOG_TRACE("Skipping update entry field for untracked instrument id=",
+        LOG_TRACE("Skipping update entry for untracked id=",
                   currentHeader.instrumentId);
-        break; // Skip this field
+        break;
       }
-
-      if (fieldSize < 2) { // Need at least type and side
-        LOG_ERROR("Update entry field (0x1001) too short: ", fieldSize);
-        processNext = false; // Stop processing this message
+      if (fieldSize < 2) {
+        LOG_ERROR("Update entry field too short: ", fieldSize);
+        processNext = false;
         break;
       }
 
       size_t eventOffset = 0;
-      // Parse event fields, using error flags for bounds checking
       CachedParsedUpdateEvent event = {};
-
-      // Read event type and side
       event.eventType = static_cast<EventType>(fieldData[eventOffset++]);
       event.side = static_cast<Side>(fieldData[eventOffset++]);
-
-      // Validate event type and side
-      if (event.eventType != EventType::ADD &&
-          event.eventType != EventType::MODIFY &&
-          event.eventType != EventType::DELETE) {
-        LOG_ERROR("Invalid event type in update entry: ",
-                  static_cast<char>(event.eventType));
-        processNext = false; // Stop processing this message
+      if (event.eventType < EventType::ADD ||
+          event.eventType > EventType::DELETE ||
+          (event.side != Side::BID && event.side != Side::ASK)) {
+        LOG_ERROR("Invalid event in update entry");
+        processNext = false;
         break;
       }
-      if (event.side != Side::BID && event.side != Side::ASK) {
-        LOG_ERROR("Invalid side in update entry: ",
-                  static_cast<char>(event.side));
-        processNext = false; // Stop processing this message
-        break;
-      }
-
-      // Read VInts for the rest of the event data
       try {
         event.priceLevel = decodeVInt(fieldData, eventOffset, fieldSize);
         event.priceOffset = decodeVInt(fieldData, eventOffset, fieldSize);
         event.volume = decodeVInt(fieldData, eventOffset, fieldSize);
       } catch (const std::runtime_error &e) {
-        LOG_ERROR("Failed to decode update entry field (0x1001): ", e.what(),
-                  ". Field Size: ", fieldSize,
-                  " Initial Offset: ", offset + sizeof(FieldHeader),
-                  " Event Offset: ", eventOffset);
+        LOG_ERROR("Failed to decode update entry: ", e.what(),
+                  ". Field Size: ", fieldSize);
         processNext = false;
         break;
       }
-
-      // Check if we consumed exactly the field length
-      if (eventOffset != fieldSize) {
-        LOG_TRACE("Consumed ", eventOffset,
-                  " bytes for update entry, but fieldLen was ", fieldSize,
-                  ". Ignoring extra bytes as per README.");
-      }
-
-      LOG_TRACE("Parsed update entry: type=",
-                (event.eventType == EventType::ADD      ? "ADD"
-                 : event.eventType == EventType::MODIFY ? "MODIFY"
-                                                        : "DELETE"),
-                " side=", (event.side == Side::BID ? "BID" : "ASK"),
-                " level=", event.priceLevel, " offset=", event.priceOffset,
-                " volume=", event.volume);
-
-      // Add the successfully parsed event to the current group's list
       currentEvents.push_back(event);
-      break; // Continue parsing fields
-    }
-
-    // Handle summary fields (ignore them)
-    case UpdateFieldId::SUMMARY_1002:
-    case UpdateFieldId::SUMMARY_1011:
-    case UpdateFieldId::SUMMARY_1012:
-    case UpdateFieldId::SUMMARY_1013:
-    case UpdateFieldId::SUMMARY_1014:
-    case UpdateFieldId::SUMMARY_1015:
-    case UpdateFieldId::SUMMARY_1016:
-      LOG_TRACE("Skipping summary update field: ", std::hex,
-                static_cast<int>(fieldId), std::dec);
-      // Successfully skipped
       break;
+    }
 
     default:
       LOG_TRACE("Skipping unknown update field id=", std::hex,
                 static_cast<int>(fieldId), std::dec);
-      // Continue processing other fields
       break;
     }
 
     if (!processNext) {
-      LOG_ERROR("Stopping update message processing due to error in field ",
-                std::hex, static_cast<int>(fieldId), std::dec);
-      return; // Stop processing this message entirely
+      LOG_ERROR("Stopping update parsing due to error in field ", std::hex,
+                static_cast<int>(fieldId), std::dec);
+      return;
     }
 
-    // Advance offset to the next field
-    offset += sizeof(FieldHeader) + fieldSize;
+    ptr += fieldSize;
   }
 
-  if (offset != size) {
-    LOG_WARN("Extra data remaining at the end of update message: ",
-             (size - offset), " bytes.");
+  if (ptr != end) {
+    LOG_WARN("Extra data remaining at the end of update message: ", (end - ptr),
+             " bytes.");
   }
 
   // After processing all fields, handle the *last* group if one was parsed
-  // and is for a tracked instrument
   if (headerParsedForCurrentGroup &&
       manager_.isTrackedInstrumentId(currentHeader.instrumentId)) {
     LOG_DEBUG("Handling final update group for id=",
               currentHeader.instrumentId);
     manager_.handleUpdateMessage(currentHeader, currentEvents);
   } else if (headerParsedForCurrentGroup) {
-    LOG_TRACE("Skipping handling of final update group for untracked id=",
+    LOG_TRACE("Skipping final update group for untracked id=",
               currentHeader.instrumentId);
   }
-  LOG_DEBUG("--- Finished parsing update message, processed ", offset, " of ",
-            size, " bytes ---");
+  LOG_DEBUG("--- Finished parsing update message, processed ", size,
+            " bytes ---");
 }
 
 bool ProtocolParser::parseOrderbookField(const uint8_t *data, size_t size,
