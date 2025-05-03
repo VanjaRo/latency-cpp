@@ -113,7 +113,8 @@ make -j${NPROC}
 cd ../..
 
 # Copy the built solution executable into the solution source directory for CI
-cp "${BUILD_DIR}/solution" "${SOLUTION_DIR}"
+cp -p "${BUILD_DIR}/solution" "${SOLUTION_DIR}"
+chmod +x "${SOLUTION_DIR}/solution"
 
 echo "=== Local build completed successfully! ==="
 if [ "${USE_LIGHTPCAPNG}" = "ON" ]; then
