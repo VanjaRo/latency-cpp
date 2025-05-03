@@ -14,9 +14,9 @@ enum class LogLevel : int { // Use int for easier compile-time definition
   TRACE = 5
 };
 
-// Define COMPILE_TIME_LOG_LEVEL, default to INFO if not set by build system
+// Define COMPILE_TIME_LOG_LEVEL, default to INFO (3) if not set by build system
 #ifndef COMPILE_TIME_LOG_LEVEL
-#define COMPILE_TIME_LOG_LEVEL static_cast<int>(LogLevel::INFO)
+#define COMPILE_TIME_LOG_LEVEL 3
 #endif
 
 // Convert compile-time int back to LogLevel enum for convenience
@@ -73,8 +73,22 @@ private:
 #define LOG_ERROR(...) LOG_IMPL(LogLevel::ERROR, __VA_ARGS__)
 #define LOG_WARN(...) LOG_IMPL(LogLevel::WARN, __VA_ARGS__)
 #define LOG_INFO(...) LOG_IMPL(LogLevel::INFO, __VA_ARGS__)
+
+#if COMPILE_TIME_LOG_LEVEL >= 4
 #define LOG_DEBUG(...) LOG_IMPL(LogLevel::DEBUG, __VA_ARGS__)
+#else
+#define LOG_DEBUG(...)                                                         \
+  do {                                                                         \
+  } while (0)
+#endif
+
+#if COMPILE_TIME_LOG_LEVEL >= 5
 #define LOG_TRACE(...) LOG_IMPL(LogLevel::TRACE, __VA_ARGS__)
+#else
+#define LOG_TRACE(...)                                                         \
+  do {                                                                         \
+  } while (0)
+#endif
 
 // Macro to get the compile-time log level string
 #define COMPILE_TIME_LOG_LEVEL_STR ProtocolLogger::levelToString(CT_LOG_LEVEL)

@@ -681,7 +681,8 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
 
       uint8_t *writePtr = outputQueue_->getWritePtr();
       uint32_t count = static_cast<uint32_t>(updatedInstruments.size());
-      memcpy(writePtr, &count, sizeof(uint32_t));
+      // Write count directly via pointer for speed
+      *reinterpret_cast<uint32_t *>(writePtr) = count;
       writePtr += sizeof(uint32_t);
 
       // Only log the number of VWAPs being written
@@ -714,11 +715,12 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
 
       // Write the actual data
       for (const auto &vwap : updatedInstruments) {
-        memcpy(writePtr, &vwap.instrumentId, sizeof(uint32_t));
+        // Write VWAP fields directly via pointer for speed
+        *reinterpret_cast<uint32_t *>(writePtr) = vwap.instrumentId;
         writePtr += sizeof(uint32_t);
-        memcpy(writePtr, &vwap.numerator, sizeof(uint32_t));
+        *reinterpret_cast<uint32_t *>(writePtr) = vwap.numerator;
         writePtr += sizeof(uint32_t);
-        memcpy(writePtr, &vwap.denominator, sizeof(uint32_t));
+        *reinterpret_cast<uint32_t *>(writePtr) = vwap.denominator;
         writePtr += sizeof(uint32_t);
       }
 

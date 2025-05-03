@@ -48,6 +48,7 @@ constexpr size_t INSTRUMENT_INFO_TOTAL_LEN =
     INSTRUMENT_NAME_LEN + INSTRUMENT_UNUSED_LEN + INSTRUMENT_TICK_SIZE_LEN +
     INSTRUMENT_REFERENCE_PRICE_LEN + INSTRUMENT_ID_LEN; // Should be 112
 
+#ifndef NDEBUG
 // Helper function to dump hex bytes for debugging
 void ProtocolParser::dumpHexBytes(const uint8_t *data, size_t size,
                                   const char *prefix) {
@@ -61,10 +62,8 @@ void ProtocolParser::dumpHexBytes(const uint8_t *data, size_t size,
     char buf[4];
     snprintf(buf, sizeof(buf), "%02x ", data[i]);
     oss << buf;
-
-    // Add line break every 16 bytes for readability
     if ((i + 1) % 16 == 0 && i < dumpSize - 1) {
-      oss << "\n                    "; // Align continuation lines
+      oss << "\n                    ";
     }
   }
 
@@ -74,6 +73,7 @@ void ProtocolParser::dumpHexBytes(const uint8_t *data, size_t size,
 
   LOG_DEBUG(oss.str());
 }
+#endif
 
 void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
   size_t current_offset = 0; // Need an offset to track position
@@ -237,26 +237,26 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
   int32_t currentInstrumentId = -1;
 
   while (offset + sizeof(FieldHeader) <= size) {
-    // Read FieldHeader safely via memcpy to avoid unaligned access and
-    // exceptions
-    FieldHeader localHeader;
-    std::memcpy(&localHeader, data + offset, sizeof(localHeader));
+    // Read FieldHeader directly via pointer for speed (no memcpy)
+    const FieldHeader *localHeader =
+        getFieldPtr<FieldHeader>(data, offset, size);
     // Check for complete field availability
-    if (offset + sizeof(FieldHeader) + localHeader.fieldLen > size) {
+    if (offset + sizeof(FieldHeader) + localHeader->fieldLen > size) {
       LOG_ERROR("Incomplete field data at offset ", offset,
-                ". Field id=", std::hex, localHeader.fieldId, std::dec,
-                " Declared Length=", localHeader.fieldLen,
+                ". Field id=", std::hex, localHeader->fieldId, std::dec,
+                " Declared Length=", localHeader->fieldLen,
                 " Remaining Size=", (size - offset - sizeof(FieldHeader)));
       return; // Stop processing this message
     }
     // Proceed with parsed header
     const uint8_t *fieldData = data + offset + sizeof(FieldHeader);
-    const size_t fieldSize = localHeader.fieldLen;
-    SnapshotFieldId fieldId = static_cast<SnapshotFieldId>(localHeader.fieldId);
+    const size_t fieldSize = localHeader->fieldLen;
+    SnapshotFieldId fieldId =
+        static_cast<SnapshotFieldId>(localHeader->fieldId);
 
     LOG_TRACE("Processing snapshot field ", std::hex,
-              static_cast<int>(localHeader.fieldId), " size=", std::dec,
-              localHeader.fieldLen);
+              static_cast<int>(localHeader->fieldId), " size=", std::dec,
+              localHeader->fieldLen);
 
     bool processNext = true;
     switch (fieldId) {
@@ -267,10 +267,10 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
         break;
       }
 
-      // Copy packed data into aligned local to avoid unaligned access
-      InstrumentInfoFieldLayout localLayout;
-      std::memcpy(&localLayout, fieldData, sizeof(localLayout));
-      const auto *layout = &localLayout;
+      // Access InstrumentInfoFieldLayout directly via pointer for speed (no
+      // memcpy)
+      const InstrumentInfoFieldLayout *layout =
+          reinterpret_cast<const InstrumentInfoFieldLayout *>(fieldData);
 
       InstrumentInfo parsedInstrument = {};
       std::memcpy(parsedInstrument.name, layout->instrument_name,
@@ -322,10 +322,9 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
                   "), only reading last 4 bytes.");
       }
 
-      // Copy change number from the end of the field into aligned local
-      int32_t changeNo;
-      std::memcpy(&changeNo, fieldData + fieldSize - sizeof(changeNo),
-                  sizeof(changeNo));
+      // Read change number directly via pointer for speed (no memcpy)
+      int32_t changeNo = *reinterpret_cast<const int32_t *>(
+          fieldData + fieldSize - sizeof(int32_t));
 
       LOG_DEBUG("Parsed trading session info for ID ", currentInstrumentId,
                 ": changeNo=", changeNo);
@@ -413,24 +412,24 @@ void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
       false; // Flag: have we seen 0x0003 for the current group?
 
   while (offset + sizeof(FieldHeader) <= size) {
-    // Safely read FieldHeader into aligned local
-    FieldHeader localHeader;
-    std::memcpy(&localHeader, data + offset, sizeof(localHeader));
+    // Read FieldHeader directly via pointer for speed (no memcpy)
+    const FieldHeader *localHeader =
+        getFieldPtr<FieldHeader>(data, offset, size);
     // Validate field length against available data
-    if (offset + sizeof(FieldHeader) + localHeader.fieldLen > size) {
+    if (offset + sizeof(FieldHeader) + localHeader->fieldLen > size) {
       LOG_ERROR("Incomplete field data at offset ", offset,
-                ". Field id=", std::hex, localHeader.fieldId, std::dec,
-                " Declared Length=", localHeader.fieldLen,
+                ". Field id=", std::hex, localHeader->fieldId, std::dec,
+                " Declared Length=", localHeader->fieldLen,
                 " Remaining Size=", (size - offset - sizeof(FieldHeader)));
       return; // Stop processing this message
     }
     // Extract field payload pointer and size
     const uint8_t *fieldData = data + offset + sizeof(FieldHeader);
-    size_t fieldSize = localHeader.fieldLen;
-    UpdateFieldId fieldId = static_cast<UpdateFieldId>(localHeader.fieldId);
+    size_t fieldSize = localHeader->fieldLen;
+    UpdateFieldId fieldId = static_cast<UpdateFieldId>(localHeader->fieldId);
     LOG_TRACE("Processing update field ", std::hex,
-              static_cast<int>(localHeader.fieldId), " size=", std::dec,
-              localHeader.fieldLen);
+              static_cast<int>(localHeader->fieldId), " size=", std::dec,
+              localHeader->fieldLen);
 
     bool processNext = true;
     switch (fieldId) {
@@ -618,10 +617,9 @@ bool ProtocolParser::parseOrderbookField(const uint8_t *data, size_t size,
   // first if (!manager_.isTrackedInstrumentId(expectedInstrId)) { ... }
 
   while (offset + ENTRY_SIZE <= size) {
-    // Copy packed entry into aligned local to avoid unaligned access
-    SnapshotOrderbookEntryLayout localEntry;
-    std::memcpy(&localEntry, data + offset, sizeof(localEntry));
-    const auto *entry = &localEntry;
+    // Access entry directly via pointer for speed (no memcpy)
+    const SnapshotOrderbookEntryLayout *entry =
+        reinterpret_cast<const SnapshotOrderbookEntryLayout *>(data + offset);
 
     if (firstEntry) {
       fieldInstrumentId = entry->instrument_id;

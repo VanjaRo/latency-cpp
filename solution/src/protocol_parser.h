@@ -135,8 +135,12 @@ public:
 private:
   OrderbookManager &manager_; // Reference to the manager
 
+#ifndef NDEBUG
   // Helper function to dump hex bytes for debugging
   void dumpHexBytes(const uint8_t *data, size_t size, const char *prefix);
+#else
+  inline void dumpHexBytes(const uint8_t *, size_t, const char *) {}
+#endif
 
   template <typename T>
   static const T *getFieldPtr(const uint8_t *data, size_t offset, size_t size);
