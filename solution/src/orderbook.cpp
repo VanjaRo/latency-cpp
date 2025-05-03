@@ -230,7 +230,7 @@ void OrderbookManager::applyCachedUpdates(Orderbook &orderbook) {
     }
 
     // Check if this is the next expected update
-    if (queue_it->changeNo == orderbook.changeNo + 1) {
+    if (queue_it->changeNo == orderbook.changeNo + 1) [[likely]] {
       LOG_INFO("Applying cached update id=", orderbook.instrumentId,
                " ChangeNo: ", queue_it->changeNo);
 
@@ -296,7 +296,7 @@ void OrderbookManager::applyCachedUpdates(Orderbook &orderbook) {
       appliedCount++;
     }
     // Handle old or duplicate updates
-    else if (queue_it->changeNo <= orderbook.changeNo) {
+    else if (queue_it->changeNo <= orderbook.changeNo) [[unlikely]] {
       LOG_WARN("Discarding old/duplicate cached update for id=",
                orderbook.instrumentId, " Cached ChangeNo: ", queue_it->changeNo,
                " Book ChangeNo: ", orderbook.changeNo);
@@ -304,7 +304,7 @@ void OrderbookManager::applyCachedUpdates(Orderbook &orderbook) {
     }
     // Sequence gap detected - can't apply further updates until we get a new
     // snapshot
-    else {
+    else [[unlikely]] {
       LOG_INFO(
           "Stopping cached update application for id=", orderbook.instrumentId,
           " Gap detected. Expected: ", orderbook.changeNo + 1,
@@ -332,7 +332,7 @@ void OrderbookManager::handleUpdateMessage(
     const std::pmr::vector<CachedParsedUpdateEvent> &events) {
 
   // Skip processing for untracked instruments
-  if (!isTrackedInstrumentId(header.instrumentId)) {
+  if (!isTrackedInstrumentId(header.instrumentId)) [[unlikely]] {
     LOG_TRACE("Skipping update message for untracked instrument: ",
               header.instrumentId);
     return;
@@ -348,117 +348,113 @@ void OrderbookManager::handleUpdateMessage(
   int64_t currentChangeNo = bookExists ? ob_it->second.changeNo : -1;
   int64_t expectedChangeNo = bookExists ? currentChangeNo + 1 : -1;
 
-  // --- Check for out-of-sequence or duplicate updates ---
-  // Handle duplicate/old updates
-  if (bookIsValid && header.changeNo <= currentChangeNo) {
+  // --- Check update sequence and apply appropriate path ---
+  bool needsCaching = !bookExists || !bookIsValid ||
+                      (bookIsValid && header.changeNo != expectedChangeNo);
+  if (bookIsValid && header.changeNo <= currentChangeNo) [[unlikely]] {
+    // Discard old or duplicate updates (rare path)
     LOG_WARN("Received old update message for id=", header.instrumentId,
              " Received ChangeNo: ", header.changeNo,
              " Book ChangeNo: ", currentChangeNo, ". Discarding.");
-    return; // Discard old messages
-  }
-
-  // --- Determine if caching is needed ---
-  bool needsCaching = !bookExists || !bookIsValid ||
-                      (bookIsValid && header.changeNo != expectedChangeNo);
-
-  if (needsCaching) {
+    return;
+  } else if (needsCaching) [[unlikely]] {
+    // Cache out-of-sequence or initial updates (rare path)
     LOG_INFO("Caching update message for id=", header.instrumentId,
              " ChangeNo: ", header.changeNo, " Reason: bookExists=", bookExists,
              " bookIsValid=", bookIsValid,
              " expectedChangeNo=", expectedChangeNo);
-
-    // If book exists but update is out-of-sequence, invalidate the book
-    if (bookIsValid && header.changeNo != expectedChangeNo) {
+    if (bookIsValid && header.changeNo != expectedChangeNo) [[unlikely]] {
+      // Invalidate book on sequence gap (rare)
       LOG_WARN("Out-of-sequence update for id=", header.instrumentId,
                " Received=", header.changeNo, " Expected=", expectedChangeNo,
                ". Invalidating book.");
-      ob_it->second.isValid = false; // Invalidate book
+      ob_it->second.isValid = false;
     }
-
-    // Cache the update for later processing (use PMR-based CachedParsedUpdate)
     cachedParsedUpdates[header.instrumentId].emplace_back(
         header.changeNo, events, &updateResource);
     return;
-  }
+  } else [[likely]] {
+    // Normal in-sequence update processing (hot path)
+    // --- Direct Processing Logic ---
+    Orderbook &orderbook = ob_it->second;
+    LOG_TRACE("Processing update message directly for id=", header.instrumentId,
+              " ChangeNo: ", header.changeNo);
 
-  // --- Direct Processing Logic ---
-  Orderbook &orderbook = ob_it->second;
-  LOG_TRACE("Processing update message directly for id=", header.instrumentId,
-            " ChangeNo: ", header.changeNo);
+    // Add log for update header and event count
+    LOG_DEBUG("Processing update for ID ", header.instrumentId, " ChangeNo ",
+              header.changeNo, " with ", events.size(), " events.");
 
-  // Add log for update header and event count
-  LOG_DEBUG("Processing update for ID ", header.instrumentId, " ChangeNo ",
-            header.changeNo, " with ", events.size(), " events.");
+    // Store previous VWAP state before applying events
+    orderbook.lastVwapNumerator = orderbook.vwapNumerator;
+    orderbook.lastVwapDenominator = orderbook.vwapDenominator;
+    orderbook.vwapChanged = false;
 
-  // Store previous VWAP state before applying events
-  orderbook.lastVwapNumerator = orderbook.vwapNumerator;
-  orderbook.lastVwapDenominator = orderbook.vwapDenominator;
-  orderbook.vwapChanged = false;
+    // Validate tick size before processing events
+    if (orderbook.tickSize <= 0) {
+      LOG_WARN("Invalid tick size (", orderbook.tickSize, ") for ID ",
+               orderbook.instrumentId, ". Skipping update events.");
+      return;
+    }
 
-  // Validate tick size before processing events
-  if (orderbook.tickSize <= 0) {
-    LOG_WARN("Invalid tick size (", orderbook.tickSize, ") for ID ",
-             orderbook.instrumentId, ". Skipping update events.");
+    // Process all events in this update
+    for (const auto &event : events) {
+      double price =
+          orderbook.referencePrice + (event.priceOffset * orderbook.tickSize);
+      int priceLevelIndex = event.priceLevel - 1; // Convert 1-based to 0-based
+
+      if (priceLevelIndex < 0) {
+        LOG_ERROR("Invalid price level index (0 or negative): ",
+                  event.priceLevel, " for ID ", orderbook.instrumentId);
+        continue;
+      }
+
+      try {
+        switch (event.eventType) {
+        case EventType::ADD:
+          addPriceLevel(orderbook, event.side, priceLevelIndex, price,
+                        event.volume);
+          break;
+        case EventType::MODIFY:
+          modifyPriceLevel(orderbook, event.side, priceLevelIndex, price,
+                           event.volume);
+          break;
+        case EventType::DELETE:
+          deletePriceLevel(orderbook, event.side, priceLevelIndex);
+          break;
+        default:
+          LOG_ERROR("Unknown event type in handleUpdateMessage: ",
+                    static_cast<char>(event.eventType));
+          break;
+        }
+      } catch (const std::out_of_range &e) {
+        LOG_ERROR("Error processing price level index: ", priceLevelIndex + 1,
+                  " for ID ", orderbook.instrumentId, ": ", e.what());
+      }
+    }
+
+    // Update the change number after successfully processing all events
+    orderbook.changeNo = header.changeNo;
+
+    // Add log for orderbook state after applying events
+    LOG_DEBUG("Orderbook state for ID ", orderbook.instrumentId,
+              " after applying update ", orderbook.changeNo, ":");
+    LOG_DEBUG("  BidCount: ", orderbook.bids.size(),
+              ", AskCount: ", orderbook.asks.size());
+    LOG_DEBUG("  Bids:");
+    for (size_t i = 0; i < orderbook.bids.size(); ++i) {
+      LOG_DEBUG("    [", i, "] Price=", orderbook.bids[i].price,
+                ", Volume=", orderbook.bids[i].volume);
+    }
+    LOG_DEBUG("  Asks:");
+    for (size_t i = 0; i < orderbook.asks.size(); ++i) {
+      LOG_DEBUG("    [", i, "] Price=", orderbook.asks[i].price,
+                ", Volume=", orderbook.asks[i].volume);
+    }
+
+    // Calculate VWAP once after all events are applied
+    calculateVWAP(orderbook);
     return;
   }
-
-  // Process all events in this update
-  for (const auto &event : events) {
-    double price =
-        orderbook.referencePrice + (event.priceOffset * orderbook.tickSize);
-    int priceLevelIndex = event.priceLevel - 1; // Convert 1-based to 0-based
-
-    if (priceLevelIndex < 0) {
-      LOG_ERROR("Invalid price level index (0 or negative): ", event.priceLevel,
-                " for ID ", orderbook.instrumentId);
-      continue;
-    }
-
-    try {
-      switch (event.eventType) {
-      case EventType::ADD:
-        addPriceLevel(orderbook, event.side, priceLevelIndex, price,
-                      event.volume);
-        break;
-      case EventType::MODIFY:
-        modifyPriceLevel(orderbook, event.side, priceLevelIndex, price,
-                         event.volume);
-        break;
-      case EventType::DELETE:
-        deletePriceLevel(orderbook, event.side, priceLevelIndex);
-        break;
-      default:
-        LOG_ERROR("Unknown event type in handleUpdateMessage: ",
-                  static_cast<char>(event.eventType));
-        break;
-      }
-    } catch (const std::out_of_range &e) {
-      LOG_ERROR("Error processing price level index: ", priceLevelIndex + 1,
-                " for ID ", orderbook.instrumentId, ": ", e.what());
-    }
-  }
-
-  // Update the change number after successfully processing all events
-  orderbook.changeNo = header.changeNo;
-
-  // Add log for orderbook state after applying events
-  LOG_DEBUG("Orderbook state for ID ", orderbook.instrumentId,
-            " after applying update ", orderbook.changeNo, ":");
-  LOG_DEBUG("  BidCount: ", orderbook.bids.size(),
-            ", AskCount: ", orderbook.asks.size());
-  LOG_DEBUG("  Bids:");
-  for (size_t i = 0; i < orderbook.bids.size(); ++i) {
-    LOG_DEBUG("    [", i, "] Price=", orderbook.bids[i].price,
-              ", Volume=", orderbook.bids[i].volume);
-  }
-  LOG_DEBUG("  Asks:");
-  for (size_t i = 0; i < orderbook.asks.size(); ++i) {
-    LOG_DEBUG("    [", i, "] Price=", orderbook.asks[i].price,
-              ", Volume=", orderbook.asks[i].volume);
-  }
-
-  // Calculate VWAP once after all events are applied
-  calculateVWAP(orderbook);
 }
 
 // --- Internal Orderbook Manipulation ---
