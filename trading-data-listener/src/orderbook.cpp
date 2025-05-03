@@ -111,9 +111,9 @@ void OrderbookManager::processSnapshotOrderbook(int32_t instrumentId, Side side,
   }
 
   Orderbook &orderbook = it->second;
-  const char *sideStr = (side == Side::BID) ? "BID" : "ASK";
   LOG_TRACE("Processing snapshot OB entry: id=", instrumentId,
-            " Side=", sideStr, " Price=", price, " Volume=", volume);
+            " Side=", (side == Side::BID ? "BID" : "ASK"), " Price=", price,
+            " Volume=", volume);
 
   // Snapshot provides only top levels, directly add to vector
   if (side == Side::BID) {
@@ -304,7 +304,7 @@ void OrderbookManager::applyCachedUpdates(Orderbook &orderbook) {
     }
     // Sequence gap detected - can't apply further updates until we get a new
     // snapshot
-    else [[unlikely]] {
+    else {
       LOG_INFO(
           "Stopping cached update application for id=", orderbook.instrumentId,
           " Gap detected. Expected: ", orderbook.changeNo + 1,
@@ -488,8 +488,9 @@ void OrderbookManager::addPriceLevel(Orderbook &orderbook, Side side,
               (side == Side::BID ? "BID" : "ASK"), ". New count: ", buf.size(),
               ", Vector size: ", buf.size());
     // Log only top levels relevant for VWAP if vector is large
-    int log_limit = std::min((size_t)buf.size(), MAX_PRICE_LEVELS + 2);
-    for (int i = 0; i < log_limit; ++i) {
+    size_t log_limit =
+        std::min(buf.size(), static_cast<size_t>(MAX_PRICE_LEVELS + 2));
+    for (size_t i = 0; i < log_limit; ++i) {
       if (i < buf.size()) { // Boundary check
         LOG_DEBUG("  Level[", i, "]: Price=", buf[i].price,
                   ", Volume=", buf[i].volume);
@@ -530,8 +531,9 @@ void OrderbookManager::modifyPriceLevel(Orderbook &orderbook, Side side,
               priceLevelIndex, " (Price=", price, ", Volume=", volume, ") for ",
               (side == Side::BID ? "BID" : "ASK"), ". New count: ", buf.size(),
               ", Vector size: ", buf.size());
-    int log_limit = std::min((size_t)buf.size(), MAX_PRICE_LEVELS + 2);
-    for (int i = 0; i < log_limit; ++i) {
+    size_t log_limit =
+        std::min(buf.size(), static_cast<size_t>(MAX_PRICE_LEVELS + 2));
+    for (size_t i = 0; i < log_limit; ++i) {
       if (i < buf.size()) { // Boundary check
         LOG_DEBUG("  Level[", i, "]: Price=", buf[i].price,
                   ", Volume=", buf[i].volume);
@@ -641,8 +643,9 @@ void OrderbookManager::deletePriceLevel(Orderbook &orderbook, Side side,
     LOG_DEBUG("ID 2882 Delete Final state for ",
               (side == Side::BID ? "BID" : "ASK"), ". New count: ", buf.size(),
               ", Vector size: ", buf.size());
-    int log_limit = std::min((size_t)buf.size(), MAX_PRICE_LEVELS + 2);
-    for (int i = 0; i < log_limit; ++i) {
+    size_t log_limit =
+        std::min(buf.size(), static_cast<size_t>(MAX_PRICE_LEVELS + 2));
+    for (size_t i = 0; i < log_limit; ++i) {
       if (i < buf.size()) { // Boundary check
         LOG_DEBUG("  Level[", i, "]: Price=", buf[i].price,
                   ", Volume=", buf[i].volume);

@@ -18,7 +18,7 @@
 SharedQueue::SharedQueue(const std::string &headerPath,
                          const std::string &bufferPath, size_t bufferSize,
                          bool isProducer)
-    : bufferSize(bufferSize), isProducer(isProducer), buffer(nullptr) {
+    : buffer(nullptr), bufferSize(bufferSize), isProducer(isProducer) {
 
   // Open header file
   headerFd = open(headerPath.c_str(), O_RDWR);

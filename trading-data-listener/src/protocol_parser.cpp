@@ -85,7 +85,8 @@ void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
   if (size < sizeof(FrameHeader)) {
     LOG_ERROR("UDP payload too small to contain even a single frame header: ",
               size, " bytes < ", sizeof(FrameHeader), " bytes");
-    return;
+    throw std::runtime_error(
+        "UDP payload too small to contain even a frame header");
   }
 
   while (current_offset + sizeof(FrameHeader) <= size) { // Check if header fits
@@ -93,7 +94,8 @@ void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
     if (current_offset >= size) {
       LOG_ERROR("Parsing error: current_offset (", current_offset,
                 ") exceeds payload size (", size, ")");
-      break;
+      throw std::runtime_error(
+          "Parsing error: current_offset exceeds payload size");
     }
 
     // Extract header
@@ -103,31 +105,31 @@ void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
     } catch (const std::runtime_error &e) {
       LOG_ERROR("Error accessing frame header at offset ", current_offset, ": ",
                 e.what());
-      break;
+      throw;
+    } catch (...) {
+      LOG_ERROR("Unknown error accessing frame header");
+      throw std::runtime_error("Unknown error accessing frame header");
     }
 
-    // Validate header data
-    if (header->length == 0) [[unlikely]] {
+    // Skip zero-length messages (unlikely heartbeat)
+    if (header->length == 0) {
       LOG_WARN("Found message with zero length at offset ", current_offset,
-               ", typeId=", std::hex, static_cast<int>(header->typeId),
-               std::dec);
+               ", typeId=", header->typeId);
       current_offset += sizeof(FrameHeader);
       continue;
     }
 
-    size_t header_and_message_size = sizeof(FrameHeader) + header->length;
-
     // Check if the entire message fits within the available data
+    size_t header_and_message_size = sizeof(FrameHeader) + header->length;
     if (current_offset + header_and_message_size > size) {
       LOG_ERROR("Incomplete message: offset=", current_offset,
                 " needed=", header_and_message_size, " available=", size);
-      break; // Stop processing this payload
+      throw std::runtime_error("Incomplete message in UDP payload");
     }
 
     const uint8_t *messageData = data + current_offset + sizeof(FrameHeader);
     size_t messageSize = header->length;
 
-    // Get message type from the header
     MessageType msgType = static_cast<MessageType>(header->typeId);
 
     LOG_DEBUG("Processing message type=", std::hex, static_cast<int>(msgType),
@@ -142,7 +144,8 @@ void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
       if (messageSize < SNAPSHOT_HEADER_SKIP) {
         LOG_ERROR("Snapshot message too short after header skip: ", messageSize,
                   " bytes < ", SNAPSHOT_HEADER_SKIP, " bytes");
-        break;
+        throw std::runtime_error(
+            "Snapshot message too short after header skip");
       }
       LOG_DEBUG("Snapshot message: skipping additional ", SNAPSHOT_HEADER_SKIP,
                 " bytes of header");
@@ -150,49 +153,25 @@ void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
                    std::min(SNAPSHOT_HEADER_SKIP + 16, messageSize),
                    "Snapshot header and content start");
 
-      // Skip the additional message header bytes as described in README
+      // Skip the additional message header bytes and let any exception bubble
       messageData += SNAPSHOT_HEADER_SKIP;
-
-      // Important: per README, we're not adjusting messageSize since the length
-      // field already accounts only for the content after the common 3-byte
-      // header
-      try {
-        LOG_DEBUG("Passing messageSize of ", messageSize,
-                  " bytes to parseSnapshotMessage");
-        parseSnapshotMessage(messageData, messageSize);
-      } catch (const std::exception &e) {
-        LOG_ERROR("Exception in parseSnapshotMessage: ", e.what());
-      } catch (...) {
-        LOG_ERROR("Unknown exception in parseSnapshotMessage");
-      }
+      parseSnapshotMessage(messageData, messageSize);
       break;
     }
     case MessageType::UPDATE: {
       if (messageSize < UPDATE_HEADER_SKIP) {
         LOG_ERROR("Update message too short after header skip: ", messageSize,
                   " bytes < ", UPDATE_HEADER_SKIP, " bytes");
-        break;
+        throw std::runtime_error("Update message too short after header skip");
       }
       LOG_DEBUG("Update message: skipping additional ", UPDATE_HEADER_SKIP,
                 " bytes of header");
       dumpHexBytes(messageData, std::min(UPDATE_HEADER_SKIP + 16, messageSize),
                    "Update header and content start");
 
-      // Skip the additional message header bytes as described in README
+      // Skip the additional message header bytes and let any exception bubble
       messageData += UPDATE_HEADER_SKIP;
-
-      // Important: per README, we're not adjusting messageSize since the length
-      // field already accounts only for the content after the common 3-byte
-      // header
-      try {
-        LOG_DEBUG("Passing messageSize of ", messageSize,
-                  " bytes to parseUpdateMessage");
-        parseUpdateMessage(messageData, messageSize);
-      } catch (const std::exception &e) {
-        LOG_ERROR("Exception in parseUpdateMessage: ", e.what());
-      } catch (...) {
-        LOG_ERROR("Unknown exception in parseUpdateMessage");
-      }
+      parseUpdateMessage(messageData, messageSize);
       break;
     }
     default:
@@ -219,7 +198,11 @@ void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
   } else if (current_offset > size) {
     LOG_ERROR("Parsing error detected: advanced past end of payload (",
               current_offset, " > ", size, ")");
+    throw std::runtime_error("Parsing error: advanced past end of UDP payload");
   }
+
+  // Completed parsing successfully
+  return;
 }
 
 // Private helper methods (add these to the implementation)
@@ -276,7 +259,7 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
       LOG_ERROR(
           "Incomplete field data in snapshot parse: FieldId=", hdr.fieldId,
           " Declared Length=", hdr.fieldLen, " Remaining Bytes=", (end - ptr));
-      return;
+      throw std::runtime_error("Incomplete field data in snapshot parse");
     }
     const uint8_t *fieldData = ptr;
     size_t fieldSize = hdr.fieldLen;
@@ -391,7 +374,7 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
     if (!processNext) {
       LOG_ERROR("Stopping snapshot message processing due to error in field ",
                 std::hex, static_cast<int>(fieldId), std::dec);
-      return;
+      throw std::runtime_error("Error processing snapshot message field");
     }
 
     ptr += fieldSize;
@@ -445,7 +428,7 @@ void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
       LOG_ERROR("Incomplete update field: FieldId=", hdr.fieldId,
                 " Declared Length=", hdr.fieldLen,
                 " Remaining Bytes=", (end - ptr));
-      return;
+      throw std::runtime_error("Incomplete update field in update message");
     }
     const uint8_t *fieldData = ptr;
     size_t fieldSize = hdr.fieldLen;
@@ -550,7 +533,7 @@ void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
     if (!processNext) {
       LOG_ERROR("Stopping update parsing due to error in field ", std::hex,
                 static_cast<int>(fieldId), std::dec);
-      return;
+      throw std::runtime_error("Error processing update message field");
     }
 
     ptr += fieldSize;

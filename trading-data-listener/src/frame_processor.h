@@ -58,19 +58,18 @@ using FrameCallback =
 // Stub implementation of PcapReader
 class PcapReader {
 public:
-  explicit PcapReader(const std::string &filename) {
+  explicit PcapReader(const std::string &) {
     throw std::runtime_error(
         "PcapReader is disabled because USE_LIGHTPCAPNG is not enabled");
   }
   ~PcapReader() = default;
 
-  void processAllFrames(const FrameCallback &callback) {
+  void processAllFrames(const FrameCallback &) {
     throw std::runtime_error(
         "PcapReader is disabled because USE_LIGHTPCAPNG is not enabled");
   }
 
-  void processFilteredFrames(uint32_t sourceIP, uint32_t destIP,
-                             const FrameCallback &callback) {
+  void processFilteredFrames(uint32_t, uint32_t, const FrameCallback &) {
     throw std::runtime_error(
         "PcapReader is disabled because USE_LIGHTPCAPNG is not enabled");
   }

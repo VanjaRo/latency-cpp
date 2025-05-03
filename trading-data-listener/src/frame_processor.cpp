@@ -146,7 +146,7 @@ void FrameProcessor::runPcap() {
               }
             }
 
-            // Process the payload
+            // Process the payload (will throw on any parse error)
             protocolParser_.parsePayload(data, size);
 
             // Even after successful parsing, we still write 0 for snapshot
@@ -475,10 +475,10 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
                   ") exceeds IP frame boundary (size ", info.frameSize,
                   "). Clamping payload length.");
         // Adjust payload length to prevent reading out of bounds
-        info.payloadLength =
-            (info.payloadLength > (frameEndBasedOnIp - info.payload))
-                ? (frameEndBasedOnIp - info.payload)
-                : 0;
+        ptrdiff_t rawMaxPayload = frameEndBasedOnIp - info.payload;
+        size_t maxPayload =
+            rawMaxPayload > 0 ? static_cast<size_t>(rawMaxPayload) : 0;
+        info.payloadLength = info.payloadLength > maxPayload ? maxPayload : 0;
         if (info.payloadLength > 0) {
           LOG_WARN("[Frame ", frameCounter, "] Clamped payload length to ",
                    info.payloadLength);
@@ -695,14 +695,12 @@ bool FrameProcessor::processPacketPayload(const PacketInfo &packetInfo,
   try {
     LOG_TRACE("[Frame ", frameCounter, "] Parsing payload (",
               packetInfo.payloadLength, " bytes)...");
-
-    // Let the protocol parser handle the parsing logic
+    // Let the protocol parser handle the parsing logic (will throw on error)
     protocolParser_.parsePayload(packetInfo.payload, packetInfo.payloadLength);
-
     LOG_TRACE("[Frame ", frameCounter, "] Payload parsing complete.");
   } catch (const std::exception &e) {
     LOG_ERROR("[Frame ", frameCounter, "] Error parsing payload: ", e.what());
-    processingError = true; // Mark error to treat as snapshot for output
+    processingError = true; // Treat any exception as processing error
   } catch (...) {
     LOG_ERROR("[Frame ", frameCounter,
               "] Unknown error during payload parsing.");
@@ -715,7 +713,7 @@ bool FrameProcessor::processPacketPayload(const PacketInfo &packetInfo,
 // Helper function to advance the input queue consumer
 void FrameProcessor::advanceInputQueue(const PacketInfo &packetInfo,
                                        uint64_t frameCounter) {
-  uint32_t currentOffset =
+  [[maybe_unused]] uint32_t currentOffset =
       inputQueue_->header->consumer_offset.load(std::memory_order_relaxed);
 
   LOG_DEBUG("[Frame ", frameCounter, "] Advancing consumer by aligned size: ",
@@ -725,7 +723,7 @@ void FrameProcessor::advanceInputQueue(const PacketInfo &packetInfo,
 
   if (packetInfo.alignedFrameSize > 0) {
     inputQueue_->advanceConsumer(packetInfo.alignedFrameSize);
-    uint32_t newOffset =
+    [[maybe_unused]] uint32_t newOffset =
         inputQueue_->header->consumer_offset.load(std::memory_order_relaxed);
     LOG_DEBUG("[Frame ", frameCounter, "] Consumer advanced from ",
               currentOffset, " to ", newOffset,
@@ -735,7 +733,7 @@ void FrameProcessor::advanceInputQueue(const PacketInfo &packetInfo,
              "] Packet resulted in 0 alignedFrameSize (Likely non-IP or "
              "invalid header). Advancing by minimum 8 bytes.");
     inputQueue_->advanceConsumer(SharedQueue::align8(8));
-    uint32_t newOffset =
+    [[maybe_unused]] uint32_t newOffset =
         inputQueue_->header->consumer_offset.load(std::memory_order_relaxed);
     LOG_DEBUG("[Frame ", frameCounter, "] Consumer advanced from ",
               currentOffset, " to ", newOffset,
