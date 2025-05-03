@@ -10,6 +10,7 @@ BUILD_TYPE="debug"
 USE_HUGEPAGES="false"
 DATA_DIR="./lat-spring-data"
 RESULTS_DIR="./results"
+PROJECT_DIR="./trading-data-listener"
 
 TEST_MODE="all"
 PCAP_FILE="all"
@@ -49,7 +50,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Determine the solution binary based on build type
-SOLUTION_BIN="./solution/build_${BUILD_TYPE}/solution"
+SOLUTION_BIN="./solution"
 
 if [ ! -x "${SOLUTION_BIN}" ]; then
     echo "Error: Solution binary not found or not executable at ${SOLUTION_BIN}"

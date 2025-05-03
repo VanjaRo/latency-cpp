@@ -93,7 +93,7 @@ public:
 private:
   // Backoff parameters for busy-wait loops
   static constexpr int BACKOFF_SPIN_LIMIT = 50;
-  static constexpr int BACKOFF_YIELD_LIMIT = 200;
+  static constexpr int BACKOFF_YIELD_LIMIT = 100;
 
   // Helper to apply unified spin/yield/sleep backoff
   static void backoffDelay(int &counter);

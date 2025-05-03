@@ -183,71 +183,19 @@ void FrameProcessor::runPcap() {
 }
 
 // Helper function to wait for a minimum number of bytes in the queue
-bool FrameProcessor::waitForBytes(size_t requiredBytes, uint64_t frameCounter,
-                                  const char *waitReason) {
-  size_t readableBytes = 0;
-  int wait_count = 0;
-  const int max_wait_cycles = 10000000; // ~100 seconds timeout with 10us sleep
-  const int log_interval = 100000;      // Log every second or so
-
-  while (true) { // Loop until we break due to success or failure
-    // Get current offset values directly to check them
-    uint32_t current_producer =
-        inputQueue_->header->producer_offset.load(std::memory_order_acquire);
-    uint32_t current_consumer =
-        inputQueue_->header->consumer_offset.load(std::memory_order_acquire);
-
-    // Get readable bytes after verification
-    readableBytes = inputQueue_->getReadableBytes();
-
-    // --- Check 1: Do we have enough bytes? ---
-    if (readableBytes >= requiredBytes) {
-      break; // Exit the while loop, success!
-    }
-
-    // --- Check 2: Timeout ---
-    if (wait_count >= max_wait_cycles) {
-      // Log the state at timeout
-      LOG_ERROR("[Frame ", frameCounter, "] [", waitReason,
-                " WAIT TIMEOUT] Stuck waiting for ", requiredBytes,
-                " bytes. Have ", readableBytes, " (Prod: ", current_producer,
-                ", Cons: ", current_consumer, "). Aborting wait.");
-      return false; // Indicate timeout/failure
-    }
-
-    // --- Wait Logic ---
-    if (wait_count == 0 || wait_count % log_interval == 0) {
-      LOG_DEBUG("[Frame ", frameCounter, "] [", waitReason,
-                " WAIT] Waiting for ", requiredBytes, " bytes, have ",
-                readableBytes, " (Prod: ", current_producer,
-                ", Cons: ", current_consumer, ")");
-    }
-    // unified backoff
-    backoffDelay(wait_count);
-
-  } // --- End while(true) ---
-
-  // If we exited the loop, it means success condition was met.
-  uint32_t final_producer =
-      inputQueue_->header->producer_offset.load(std::memory_order_relaxed);
-  uint32_t final_consumer =
-      inputQueue_->header->consumer_offset.load(std::memory_order_relaxed);
-  LOG_TRACE("[Frame ", frameCounter, "] [", waitReason,
-            " WAIT] Acquired required ", requiredBytes, " bytes (have ",
-            readableBytes, ", Prod: ", final_producer,
-            ", Cons: ", final_consumer, ").");
-  return true; // Success
+bool FrameProcessor::waitForBytes(size_t requiredBytes,
+                                  uint64_t /*frameCounter*/,
+                                  const char * /*waitReason*/) {
+  // Tight user-space spin until the buffer has at least requiredBytes
+  while (inputQueue_->getReadableBytes() < requiredBytes) {
+    _mm_pause();
+  }
+  return true;
 }
 
 // Helper to apply unified spin/yield/sleep backoff
 void FrameProcessor::backoffDelay(int &counter) {
-  if (counter < BACKOFF_SPIN_LIMIT) {
-    _mm_pause();
-  } else if (counter < BACKOFF_YIELD_LIMIT) {
-    std::this_thread::yield();
-  } else {
-    std::this_thread::sleep_for(std::chrono::microseconds(1));
-  }
+  _mm_pause();
   ++counter;
 }
 
