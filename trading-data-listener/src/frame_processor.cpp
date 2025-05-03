@@ -1,5 +1,6 @@
 #include "frame_processor.h"
 #include "protocol_logger.h"
+#include <emmintrin.h>
 #include <iostream> // For PCAP direct mode output
 
 #include <arpa/inet.h> // For ntohs, ntohl, inet_pton
@@ -803,31 +804,32 @@ void FrameProcessor::runQueue() {
       consecutiveErrors++;
       LOG_ERROR("Caught exception in frame processing loop: ", e.what(),
                 " (frame ", frameCounter, ", error #", consecutiveErrors, ")");
-
+      // Write a zero to output to unblock runner and advance consumer minimally
+      writeOutput(true, frameCounter);
+      inputQueue_->advanceConsumer(SharedQueue::align8(8));
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
         LOG_ERROR("Too many consecutive errors (", consecutiveErrors,
                   "), halting processing.");
         break;
       }
-
       // Sleep briefly before retrying
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      // Still increment frame counter to avoid getting stuck on the same frame
+      _mm_pause();
+      // Advance frame counter to avoid getting stuck
       frameCounter++;
     } catch (...) {
       consecutiveErrors++;
       LOG_ERROR("Caught unknown exception in frame processing loop ", "(frame ",
                 frameCounter, ", error #", consecutiveErrors, ")");
-
+      // Write a zero to output to unblock runner and advance consumer minimally
+      writeOutput(true, frameCounter);
+      inputQueue_->advanceConsumer(SharedQueue::align8(8));
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
         LOG_ERROR("Too many consecutive errors (", consecutiveErrors,
                   "), halting processing.");
         break;
       }
-
-      // Sleep briefly before retrying
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      // Still increment frame counter to avoid getting stuck on the same frame
+      _mm_pause();
+      // Advance frame counter to avoid getting stuck
       frameCounter++;
     }
   }
