@@ -11,7 +11,7 @@
 // Decode ZigZag encoded vint
 int64_t ProtocolParser::decodeVInt(const uint8_t *data, size_t &offset,
                                    size_t available_bytes) {
-  uint64_t unsigned_result = 0; // Use unsigned for varint decoding
+  uint64_t unsigned_result = 0;
   int shift = 0;
 
   while (true) {
@@ -21,22 +21,17 @@ int64_t ProtocolParser::decodeVInt(const uint8_t *data, size_t &offset,
     }
     uint8_t byte = data[offset++];
     unsigned_result |= static_cast<uint64_t>(byte & 0x7F) << shift;
-    // If the most significant bit is not set, this is the last byte.
     if (!(byte & 0x80)) {
       break;
     }
     shift += 7;
-    // Check for overflow: 10 bytes * 7 bits/byte = 70 bits, max is 64.
-    // If shift reaches 63 (meaning we are processing the 10th byte),
-    // the last byte must not have the MSB set and must contribute <= 1 bit.
-    if (shift >= 64) { // Varint technically uses max 10 bytes for 64 bits
+    if (shift >= 64) { // Varint too long or malformed
       throw std::runtime_error(
           "Variable-length integer is too long or malformed");
     }
   }
   // ZigZag decode: (unsigned_result >> 1) ^ -(unsigned_result & 1)
-  int64_t result = (unsigned_result >> 1) ^ (-(int64_t)(unsigned_result & 1));
-  return result;
+  return (unsigned_result >> 1) ^ (-(int64_t)(unsigned_result & 1));
 }
 
 // Constants for header skips
@@ -112,7 +107,7 @@ void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
     }
 
     // Validate header data
-    if (header->length == 0) {
+    if (header->length == 0) [[unlikely]] {
       LOG_WARN("Found message with zero length at offset ", current_offset,
                ", typeId=", std::hex, static_cast<int>(header->typeId),
                std::dec);
@@ -242,30 +237,26 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
   int32_t currentInstrumentId = -1;
 
   while (offset + sizeof(FieldHeader) <= size) {
-    const FieldHeader *header = nullptr;
-    try {
-      header = getFieldPtr<FieldHeader>(data, offset, size);
-    } catch (const std::runtime_error &e) {
-      LOG_ERROR("Error accessing field header at offset ", offset, ": ",
-                e.what());
-      return; // Stop processing this message
-    }
-
-    if (offset + sizeof(FieldHeader) + header->fieldLen > size) {
+    // Read FieldHeader safely via memcpy to avoid unaligned access and
+    // exceptions
+    FieldHeader localHeader;
+    std::memcpy(&localHeader, data + offset, sizeof(localHeader));
+    // Check for complete field availability
+    if (offset + sizeof(FieldHeader) + localHeader.fieldLen > size) {
       LOG_ERROR("Incomplete field data at offset ", offset,
-                ". Field id=", std::hex, header->fieldId, std::dec,
-                " Declared Length=", header->fieldLen,
+                ". Field id=", std::hex, localHeader.fieldId, std::dec,
+                " Declared Length=", localHeader.fieldLen,
                 " Remaining Size=", (size - offset - sizeof(FieldHeader)));
       return; // Stop processing this message
     }
-
+    // Proceed with parsed header
     const uint8_t *fieldData = data + offset + sizeof(FieldHeader);
-    const size_t fieldSize = header->fieldLen;
-    SnapshotFieldId fieldId = static_cast<SnapshotFieldId>(header->fieldId);
+    const size_t fieldSize = localHeader.fieldLen;
+    SnapshotFieldId fieldId = static_cast<SnapshotFieldId>(localHeader.fieldId);
 
     LOG_TRACE("Processing snapshot field ", std::hex,
-              static_cast<int>(header->fieldId), " size=", std::dec,
-              header->fieldLen);
+              static_cast<int>(localHeader.fieldId), " size=", std::dec,
+              localHeader.fieldLen);
 
     bool processNext = true;
     switch (fieldId) {
@@ -276,8 +267,10 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
         break;
       }
 
-      const auto *layout =
-          reinterpret_cast<const InstrumentInfoFieldLayout *>(fieldData);
+      // Copy packed data into aligned local to avoid unaligned access
+      InstrumentInfoFieldLayout localLayout;
+      std::memcpy(&localLayout, fieldData, sizeof(localLayout));
+      const auto *layout = &localLayout;
 
       InstrumentInfo parsedInstrument = {};
       std::memcpy(parsedInstrument.name, layout->instrument_name,
@@ -311,19 +304,17 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
       if (currentInstrumentId == -1) {
         LOG_WARN("Received trading session info (0x0102) without preceding "
                  "instrument info (0x0101). Skipping field.");
-        // Continue processing other fields, maybe INSTRUMENT_INFO comes later
-        // (though unlikely/invalid)
         break;
       }
       if (!manager_.isTrackedInstrumentId(currentInstrumentId)) {
         LOG_TRACE("Skipping trading session info for untracked id=",
                   currentInstrumentId);
-        break; // Skip if the current instrument isn't tracked
+        break;
       }
 
       if (fieldSize < sizeof(int32_t)) {
         LOG_ERROR("TRADING_SESSION_INFO field too short: ", fieldSize);
-        processNext = false; // Stop processing this message
+        processNext = false;
         break;
       }
       if (fieldSize > sizeof(int32_t)) {
@@ -331,16 +322,17 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
                   "), only reading last 4 bytes.");
       }
 
-      // Read from the *end* of the field buffer
-      int32_t changeNo = *reinterpret_cast<const int32_t *>(
-          fieldData + fieldSize - sizeof(int32_t));
+      // Copy change number from the end of the field into aligned local
+      int32_t changeNo;
+      std::memcpy(&changeNo, fieldData + fieldSize - sizeof(changeNo),
+                  sizeof(changeNo));
 
       LOG_DEBUG("Parsed trading session info for ID ", currentInstrumentId,
                 ": changeNo=", changeNo);
 
       manager_.updateSnapshotChangeNo(currentInstrumentId, changeNo);
 
-      break; // Continue to next field
+      break;
     }
 
     case SnapshotFieldId::ORDERBOOK: {
@@ -421,30 +413,24 @@ void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
       false; // Flag: have we seen 0x0003 for the current group?
 
   while (offset + sizeof(FieldHeader) <= size) {
-    const FieldHeader *header = nullptr;
-    try {
-      header = getFieldPtr<FieldHeader>(data, offset, size);
-    } catch (const std::runtime_error &e) {
-      LOG_ERROR("Error accessing field header at offset ", offset, ": ",
-                e.what());
-      return; // Stop processing this message
-    }
-
-    if (offset + sizeof(FieldHeader) + header->fieldLen > size) {
+    // Safely read FieldHeader into aligned local
+    FieldHeader localHeader;
+    std::memcpy(&localHeader, data + offset, sizeof(localHeader));
+    // Validate field length against available data
+    if (offset + sizeof(FieldHeader) + localHeader.fieldLen > size) {
       LOG_ERROR("Incomplete field data at offset ", offset,
-                ". Field id=", std::hex, header->fieldId, std::dec,
-                " Declared Length=", header->fieldLen,
+                ". Field id=", std::hex, localHeader.fieldId, std::dec,
+                " Declared Length=", localHeader.fieldLen,
                 " Remaining Size=", (size - offset - sizeof(FieldHeader)));
       return; // Stop processing this message
     }
-
+    // Extract field payload pointer and size
     const uint8_t *fieldData = data + offset + sizeof(FieldHeader);
-    const size_t fieldSize = header->fieldLen;
-    UpdateFieldId fieldId = static_cast<UpdateFieldId>(header->fieldId);
-
+    size_t fieldSize = localHeader.fieldLen;
+    UpdateFieldId fieldId = static_cast<UpdateFieldId>(localHeader.fieldId);
     LOG_TRACE("Processing update field ", std::hex,
-              static_cast<int>(header->fieldId), " size=", std::dec,
-              header->fieldLen);
+              static_cast<int>(localHeader.fieldId), " size=", std::dec,
+              localHeader.fieldLen);
 
     bool processNext = true;
     switch (fieldId) {
@@ -461,8 +447,6 @@ void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
               currentHeader.instrumentId);
         }
         currentEvents.clear(); // Reset for the new group regardless
-        // headerParsedForCurrentGroup will be reset below or stay true if new
-        // parse succeeds
       }
 
       // Parse the new header
@@ -470,33 +454,28 @@ void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
       try {
         currentHeader.instrumentId =
             decodeVInt(fieldData, headerFieldOffset, fieldSize);
-        // No need to check offset >= fieldSize immediately, decodeVInt handles
-        // bounds check inside
         currentHeader.changeNo =
             decodeVInt(fieldData, headerFieldOffset, fieldSize);
-
-        LOG_DEBUG(
-            "Parsed update header: instrumentId=", currentHeader.instrumentId,
-            " changeNo=", currentHeader.changeNo);
-
-        // Mark that we have a header for the *next* set of events
-        headerParsedForCurrentGroup = true;
-
-        // Check if VInt decoding consumed exactly fieldSize (optional, for
-        // sanity)
-        if (headerFieldOffset != fieldSize) {
-          LOG_TRACE("VInt decoding for update header consumed ",
-                    headerFieldOffset, " bytes, but fieldLen was ", fieldSize,
-                    ". Header likely valid.");
-        }
-
       } catch (const std::runtime_error &e) {
         LOG_ERROR("Failed to decode update header: ", e.what(),
                   ". Field Size: ", fieldSize);
-        headerParsedForCurrentGroup =
-            false; // Ensure we don't process subsequent events
-        processNext =
-            false; // Stop processing this message on header decode error
+        headerParsedForCurrentGroup = false;
+        processNext = false;
+      }
+
+      LOG_DEBUG(
+          "Parsed update header: instrumentId=", currentHeader.instrumentId,
+          " changeNo=", currentHeader.changeNo);
+
+      // Mark that we have a header for the *next* set of events
+      headerParsedForCurrentGroup = true;
+
+      // Check if VInt decoding consumed exactly fieldSize (optional, for
+      // sanity)
+      if (headerFieldOffset != fieldSize) {
+        LOG_TRACE("VInt decoding for update header consumed ",
+                  headerFieldOffset, " bytes, but fieldLen was ", fieldSize,
+                  ". Header likely valid.");
       }
       break; // Continue parsing fields
     }
@@ -521,61 +500,60 @@ void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
       }
 
       size_t eventOffset = 0;
+      // Parse event fields, using error flags for bounds checking
+      CachedParsedUpdateEvent event = {};
+
+      // Read event type and side
+      event.eventType = static_cast<EventType>(fieldData[eventOffset++]);
+      event.side = static_cast<Side>(fieldData[eventOffset++]);
+
+      // Validate event type and side
+      if (event.eventType != EventType::ADD &&
+          event.eventType != EventType::MODIFY &&
+          event.eventType != EventType::DELETE) {
+        LOG_ERROR("Invalid event type in update entry: ",
+                  static_cast<char>(event.eventType));
+        processNext = false; // Stop processing this message
+        break;
+      }
+      if (event.side != Side::BID && event.side != Side::ASK) {
+        LOG_ERROR("Invalid side in update entry: ",
+                  static_cast<char>(event.side));
+        processNext = false; // Stop processing this message
+        break;
+      }
+
+      // Read VInts for the rest of the event data
       try {
-        CachedParsedUpdateEvent event = {};
-
-        // Read event type and side
-        event.eventType = static_cast<EventType>(fieldData[eventOffset++]);
-        event.side = static_cast<Side>(fieldData[eventOffset++]);
-
-        // Validate event type and side
-        if (event.eventType != EventType::ADD &&
-            event.eventType != EventType::MODIFY &&
-            event.eventType != EventType::DELETE) {
-          LOG_ERROR("Invalid event type in update entry: ",
-                    static_cast<char>(event.eventType));
-          processNext = false; // Stop processing this message
-          break;
-        }
-        if (event.side != Side::BID && event.side != Side::ASK) {
-          LOG_ERROR("Invalid side in update entry: ",
-                    static_cast<char>(event.side));
-          processNext = false; // Stop processing this message
-          break;
-        }
-
-        // Read VInts for the rest of the event data
-        // decodeVInt advances eventOffset and checks bounds internally
         event.priceLevel = decodeVInt(fieldData, eventOffset, fieldSize);
         event.priceOffset = decodeVInt(fieldData, eventOffset, fieldSize);
         event.volume = decodeVInt(fieldData, eventOffset, fieldSize);
-
-        // Check if we consumed exactly the field length
-        if (eventOffset != fieldSize) {
-          LOG_TRACE("Consumed ", eventOffset,
-                    " bytes for update entry, but fieldLen was ", fieldSize,
-                    ". Ignoring extra bytes as per README.");
-        }
-
-        LOG_TRACE("Parsed update entry: type=",
-                  (event.eventType == EventType::ADD      ? "ADD"
-                   : event.eventType == EventType::MODIFY ? "MODIFY"
-                                                          : "DELETE"),
-                  " side=", (event.side == Side::BID ? "BID" : "ASK"),
-                  " level=", event.priceLevel, " offset=", event.priceOffset,
-                  " volume=", event.volume);
-
-        // Add the successfully parsed event to the current group's list
-        currentEvents.push_back(event);
-
       } catch (const std::runtime_error &e) {
         LOG_ERROR("Failed to decode update entry field (0x1001): ", e.what(),
                   ". Field Size: ", fieldSize,
                   " Initial Offset: ", offset + sizeof(FieldHeader),
                   " Event Offset: ", eventOffset);
-        processNext =
-            false; // Stop processing this message on event decode error
+        processNext = false;
+        break;
       }
+
+      // Check if we consumed exactly the field length
+      if (eventOffset != fieldSize) {
+        LOG_TRACE("Consumed ", eventOffset,
+                  " bytes for update entry, but fieldLen was ", fieldSize,
+                  ". Ignoring extra bytes as per README.");
+      }
+
+      LOG_TRACE("Parsed update entry: type=",
+                (event.eventType == EventType::ADD      ? "ADD"
+                 : event.eventType == EventType::MODIFY ? "MODIFY"
+                                                        : "DELETE"),
+                " side=", (event.side == Side::BID ? "BID" : "ASK"),
+                " level=", event.priceLevel, " offset=", event.priceOffset,
+                " volume=", event.volume);
+
+      // Add the successfully parsed event to the current group's list
+      currentEvents.push_back(event);
       break; // Continue parsing fields
     }
 
@@ -640,8 +618,10 @@ bool ProtocolParser::parseOrderbookField(const uint8_t *data, size_t size,
   // first if (!manager_.isTrackedInstrumentId(expectedInstrId)) { ... }
 
   while (offset + ENTRY_SIZE <= size) {
-    const auto *entry =
-        reinterpret_cast<const SnapshotOrderbookEntryLayout *>(data + offset);
+    // Copy packed entry into aligned local to avoid unaligned access
+    SnapshotOrderbookEntryLayout localEntry;
+    std::memcpy(&localEntry, data + offset, sizeof(localEntry));
+    const auto *entry = &localEntry;
 
     if (firstEntry) {
       fieldInstrumentId = entry->instrument_id;
