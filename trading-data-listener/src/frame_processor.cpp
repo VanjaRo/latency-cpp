@@ -47,8 +47,6 @@ bool FrameProcessor::loadMetadata() {
         snapshotIP_ = ipStringToUint32(ip1_str);
         updateIP_ = ipStringToUint32(ip2_str);
         LOG_INFO("Target IPs loaded: Snapshot=", ip1_str, ", Update=", ip2_str);
-        LOG_INFO("Note: IP-based message type detection is now deprecated, "
-                 "using message header instead");
       } catch (const std::runtime_error &e) {
         LOG_ERROR("Failed to parse IPs from metadata: ", e.what());
         return false;
@@ -529,6 +527,9 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
 // Helper function to write output to the queue
 void FrameProcessor::writeOutput(bool isSnapshotOrError,
                                  uint64_t frameCounter) {
+  LOG_DEBUG("[Frame ", frameCounter,
+            "] writeOutput called, isSnapshotOrError=", isSnapshotOrError);
+
   if (usePcap_) [[unlikely]] {
     // PCAP direct mode: print output to stdout
     if (isSnapshotOrError) {
@@ -549,45 +550,65 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
     }
     return;
   }
+
   const size_t output_size_zero = sizeof(uint32_t);
   const size_t output_size_result_triple = 3 * sizeof(uint32_t);
 
   if (isSnapshotOrError) {
     // Write 0 for snapshot or error cases
-    LOG_TRACE("[Frame ", frameCounter,
+    LOG_DEBUG("[Frame ", frameCounter,
               "] Preparing to write output: 0 (Snapshot/Error)");
+
+    // Check if we can write before entering the loop
+    bool canWriteNow = outputQueue_->canWrite(output_size_zero);
+    LOG_DEBUG("[Frame ", frameCounter,
+              "] Initial canWrite check: ", canWriteNow, " for ",
+              output_size_zero, " bytes");
+
     int wait_cycles = 0;
     while (!outputQueue_->canWrite(output_size_zero)) {
-      if (wait_cycles % 10000 == 0) {
+      if (wait_cycles % 1000 ==
+          0) { // Reduced from 10000 to get earlier warnings
         uint32_t prod = outputQueue_->header->producer_offset.load(
             std::memory_order_relaxed);
         uint32_t cons = outputQueue_->header->consumer_offset.load(
             std::memory_order_relaxed);
         LOG_WARN("[Frame ", frameCounter,
                  "] Waiting to write 0 to output queue... (Prod:", prod,
-                 " Cons:", cons, ")");
+                 " Cons:", cons, ", Cycles:", wait_cycles, ")");
       }
       // unified backoff
       backoffDelay(wait_cycles);
     }
+
     LOG_DEBUG("[Frame ", frameCounter,
               "] Output queue has space for 0. Writing...");
     uint32_t *writePtr =
         reinterpret_cast<uint32_t *>(outputQueue_->getWritePtr());
     *writePtr = 0;
     outputQueue_->advanceProducer(output_size_zero);
-    LOG_TRACE("[Frame ", frameCounter, "] Wrote output: 0 (Snapshot/Error)");
+    LOG_DEBUG("[Frame ", frameCounter, "] Wrote output: 0 (Snapshot/Error)");
   } else {
     // Get instruments that were updated in this frame and have valid orderbooks
     auto updatedInstruments = orderbookManager_.getUpdatedInstruments();
+    LOG_DEBUG("[Frame ", frameCounter, "] Got ", updatedInstruments.size(),
+              " updated instruments");
 
     if (updatedInstruments.empty()) {
       // Write 0 if no updated instruments with valid orderbooks
-      LOG_TRACE("[Frame ", frameCounter,
+      LOG_DEBUG("[Frame ", frameCounter,
                 "] Preparing to write output: 0 (No updated instruments)");
+
+      // Check if we can write before entering the loop
+      bool canWriteNow = outputQueue_->canWrite(output_size_zero);
+      LOG_DEBUG("[Frame ", frameCounter,
+                "] Initial canWrite check: ", canWriteNow, " for ",
+                output_size_zero, " bytes");
+
       int wait_cycles = 0;
       while (!outputQueue_->canWrite(output_size_zero)) {
-        if (wait_cycles % 10000 == 0) {
+        if (wait_cycles % 1000 ==
+            0) { // Reduced from 10000 to get earlier warnings
           uint32_t prod = outputQueue_->header->producer_offset.load(
               std::memory_order_relaxed);
           uint32_t cons = outputQueue_->header->consumer_offset.load(
@@ -595,11 +616,12 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
           LOG_WARN("[Frame ", frameCounter,
                    "] Waiting to write 0 (no updated instruments) to output "
                    "queue... (Prod:",
-                   prod, " Cons:", cons, ")");
+                   prod, " Cons:", cons, ", Cycles:", wait_cycles, ")");
         }
         // unified backoff
         backoffDelay(wait_cycles);
       }
+
       LOG_DEBUG("[Frame ", frameCounter,
                 "] Output queue has space for 0 (no updated instruments). "
                 "Writing...");
@@ -607,7 +629,7 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
           reinterpret_cast<uint32_t *>(outputQueue_->getWritePtr());
       *writePtr = 0;
       outputQueue_->advanceProducer(output_size_zero);
-      LOG_TRACE("[Frame ", frameCounter,
+      LOG_DEBUG("[Frame ", frameCounter,
                 "] Wrote output: 0 (No updated instruments)");
     } else {
       // Write all updated instruments' VWAPs
@@ -637,25 +659,39 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
         return;
       }
 
-      LOG_TRACE("[Frame ", frameCounter, "] Preparing to write ",
+      LOG_DEBUG("[Frame ", frameCounter, "] Preparing to write ",
                 updatedInstruments.size(), " instrument VWAPs (",
                 totalBytesToWrite, " bytes)");
+
+      // Check if we can write before entering the loop
+      bool canWriteNow = outputQueue_->canWrite(totalBytesToWrite);
+      LOG_DEBUG("[Frame ", frameCounter,
+                "] Initial canWrite check: ", canWriteNow, " for ",
+                totalBytesToWrite, " bytes");
+
       int wait_cycles = 0;
       while (!outputQueue_->canWrite(totalBytesToWrite)) {
-        if (wait_cycles % 10000 == 0) {
+        if (wait_cycles % 1000 ==
+            0) { // Reduced from 10000 to get earlier warnings
           uint32_t prod = outputQueue_->header->producer_offset.load(
               std::memory_order_relaxed);
           uint32_t cons = outputQueue_->header->consumer_offset.load(
               std::memory_order_relaxed);
+
+          // Calculate buffer usage percentages for better diagnostics
+          uint32_t bufferSize = outputQueue_->getBufferSize();
+          float usagePercent = 100.0f * (prod - cons) / bufferSize;
+
           LOG_WARN("[Frame ", frameCounter, "] Waiting to write ",
                    updatedInstruments.size(), " VWAPs (", totalBytesToWrite,
                    " bytes) to output queue... (Prod:", prod, " Cons:", cons,
-                   ")");
+                   ", Used: ", usagePercent, "%, Cycles:", wait_cycles, ")");
         }
         // unified backoff
         backoffDelay(wait_cycles);
       }
-      LOG_TRACE("[Frame ", frameCounter, "] Output queue has space for ",
+
+      LOG_DEBUG("[Frame ", frameCounter, "] Output queue has space for ",
                 updatedInstruments.size(), " VWAPs. Writing...");
 
       uint8_t *writePtr = outputQueue_->getWritePtr();
@@ -665,7 +701,7 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
       writePtr += sizeof(uint32_t);
 
       // Only log the number of VWAPs being written
-      LOG_TRACE("[Frame ", frameCounter, "] Writing ", count, " VWAP values");
+      LOG_DEBUG("[Frame ", frameCounter, "] Writing ", count, " VWAP values");
 
       // In detailed trace mode, identify VWAP updates for this frame
       if (COMPILE_TIME_LOG_LEVEL >= static_cast<int>(LogLevel::TRACE)) {
@@ -704,12 +740,13 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
       }
 
       outputQueue_->advanceProducer(totalBytesToWrite);
-      LOG_TRACE("[Frame ", frameCounter, "] Advanced output producer by ",
+      LOG_DEBUG("[Frame ", frameCounter, "] Advanced output producer by ",
                 totalBytesToWrite);
     }
     // We still clear the VWAP changed flags after writing
     orderbookManager_.clearChangedVWAPs();
   }
+  LOG_DEBUG("[Frame ", frameCounter, "] writeOutput completed successfully");
 }
 
 // Helper function to process a valid packet's payload
@@ -796,38 +833,61 @@ void FrameProcessor::processSingleFrame(uint64_t frameCounter) {
   LOG_DEBUG("[Frame ", frameCounter, "] ----- Start Processing -----");
 
   // 1. Parse the next packet (network level)
+  LOG_DEBUG("[Frame ", frameCounter, "] Step 1: Parsing network packet");
   PacketInfo packetInfo = parseNextPacket(frameCounter);
+  LOG_DEBUG("[Frame ", frameCounter,
+            "] Packet parsed, valid=", packetInfo.valid,
+            ", payload=", (packetInfo.payload ? "present" : "null"),
+            ", size=", packetInfo.payloadLength);
 
   // 2. Handle invalid/skipped packets - write 0 to output and advance
   if (!packetInfo.valid) {
     LOG_DEBUG("[Frame ", frameCounter, "] Invalid packet, writing 0 to output");
     writeOutput(true, frameCounter); // Write 0 for invalid packets
+    LOG_DEBUG("[Frame ", frameCounter, "] After writing 0, advancing queue");
     advanceInputQueue(packetInfo, frameCounter);
+    LOG_DEBUG("[Frame ", frameCounter,
+              "] ----- End Processing (Invalid) -----");
     return;
   }
 
   // 3. Process payload (application level)
+  LOG_DEBUG("[Frame ", frameCounter, "] Step 3: Processing packet payload");
   bool processingError = processPacketPayload(packetInfo, frameCounter);
+  LOG_DEBUG("[Frame ", frameCounter,
+            "] Payload processed, error=", processingError);
 
   // 4. Determine if this is a snapshot message by asking the protocol parser
+  LOG_DEBUG("[Frame ", frameCounter, "] Step 4: Detecting message type");
   MessageType msgType = ProtocolParser::detectMessageType(
       packetInfo.payload, packetInfo.payloadLength);
-  bool zeroWriteMessage =
-      (msgType == MessageType::SNAPSHOT || msgType == MessageType::UNKNOWN);
+  bool isSnapshotMessage = (msgType == MessageType::SNAPSHOT);
+  bool isUnknownMessage = (msgType == MessageType::UNKNOWN);
+  bool isUpdateMessage = (msgType == MessageType::UPDATE);
 
-  LOG_TRACE("[Frame ", frameCounter, "] Processing error: ", processingError,
-            " messageType: ", static_cast<int>(msgType),
-            " zeroWrite: ", zeroWriteMessage);
+  LOG_DEBUG("[Frame ", frameCounter,
+            "] Message type=", static_cast<int>(msgType), " (",
+            isSnapshotMessage  ? "SNAPSHOT"
+            : isUpdateMessage  ? "UPDATE"
+            : isUnknownMessage ? "UNKNOWN"
+                               : "INVALID",
+            "), processingError=", processingError);
 
   // 5. Write Output
+  LOG_DEBUG("[Frame ", frameCounter, "] Step 5: Writing to output. WriteZero=",
+            (isSnapshotMessage || isUnknownMessage || processingError));
   // Write 0 if it was a snapshot message OR unknown message type OR if a
   // processing error occurred
-  writeOutput(zeroWriteMessage || processingError, frameCounter);
+  writeOutput(isSnapshotMessage || isUnknownMessage || processingError,
+              frameCounter);
+  LOG_DEBUG("[Frame ", frameCounter, "] Output written successfully");
 
   // 6. Advance Input Queue Consumer
+  LOG_DEBUG("[Frame ", frameCounter, "] Step 6: Advancing input queue");
   advanceInputQueue(packetInfo, frameCounter);
+  LOG_DEBUG("[Frame ", frameCounter, "] Input queue advanced");
 
-  LOG_TRACE("[Frame ", frameCounter, "] ----- End Processing -----");
+  LOG_DEBUG("[Frame ", frameCounter, "] ----- End Processing (Success) -----");
 }
 
 // Main processing loop for Queue mode
@@ -845,17 +905,90 @@ void FrameProcessor::runQueue() {
   const int MAX_CONSECUTIVE_ERRORS =
       100; // Maximum consecutive errors before giving up
   int consecutiveErrors = 0;
+  uint32_t lastConsumerOffset = 0;
+  uint32_t lastProducerOffset = 0;
+  uint64_t stuckFrameCounter = 0;
+  bool potentiallyStuck = false;
+
+  // Diagnostic variables to track progress
+  uint64_t lastSuccessfulFrame = 0;
+  uint64_t stuckCheckInterval = 50; // Check for being stuck every 50 frames
 
   while (true) {
+    // Diagnostic check - log queue state periodically
+    if (frameCounter % stuckCheckInterval == 0) {
+      uint32_t currentConsumerOffset =
+          inputQueue_->header->consumer_offset.load(std::memory_order_relaxed);
+      uint32_t currentProducerOffset =
+          outputQueue_->header->producer_offset.load(std::memory_order_relaxed);
+
+      LOG_INFO("PROGRESS: Frame ", frameCounter,
+               ", Input queue - consumer: ", currentConsumerOffset,
+               ", Output queue - producer: ", currentProducerOffset,
+               ", Last successful: ", lastSuccessfulFrame);
+
+      // Check if we're potentially stuck by seeing if offsets haven't changed
+      if (currentConsumerOffset == lastConsumerOffset &&
+          currentProducerOffset == lastProducerOffset) {
+        stuckFrameCounter++;
+        if (stuckFrameCounter >= 3) { // Three consecutive stuck checks
+          potentiallyStuck = true;
+          LOG_ERROR("POTENTIAL HANG DETECTED! Queues haven't advanced in ",
+                    (stuckFrameCounter * stuckCheckInterval),
+                    " frames. Last successful frame: ", lastSuccessfulFrame,
+                    ", Current: ", frameCounter);
+        }
+      } else {
+        stuckFrameCounter = 0;
+        potentiallyStuck = false;
+      }
+
+      lastConsumerOffset = currentConsumerOffset;
+      lastProducerOffset = currentProducerOffset;
+    }
+
     try {
+      LOG_DEBUG("BEGIN: Starting to process frame ", frameCounter);
+
+      // Check input queue size before processing
+      size_t bytesAvailable = inputQueue_->getReadableBytes();
+      LOG_DEBUG("INPUT: Available bytes before processing: ", bytesAvailable);
+
+      // If we're potentially stuck, add extra diagnostics
+      if (potentiallyStuck) {
+        LOG_ERROR("DIAGNOSTIC: Processing potentially hanging frame ",
+                  frameCounter, ", BytesAvailable: ", bytesAvailable,
+                  ", InputOffset: ",
+                  inputQueue_->header->consumer_offset.load(
+                      std::memory_order_relaxed),
+                  ", OutputOffset: ",
+                  outputQueue_->header->producer_offset.load(
+                      std::memory_order_relaxed));
+      }
+
       processSingleFrame(frameCounter);
+
+      LOG_DEBUG("END: Finished processing frame ", frameCounter);
+
+      // Record successful frame
+      lastSuccessfulFrame = frameCounter;
       frameCounter++;        // Increment frame counter for the next iteration
       consecutiveErrors = 0; // Reset error counter on success
     } catch (const std::exception &e) {
       consecutiveErrors++;
       LOG_ERROR("Caught exception in frame processing loop: ", e.what(),
                 " (frame ", frameCounter, ", error #", consecutiveErrors, ")");
+
+      // Output more debug info when an error occurs
+      LOG_ERROR(
+          "DIAGNOSTIC: Exception at frame ", frameCounter, ", InputOffset: ",
+          inputQueue_->header->consumer_offset.load(std::memory_order_relaxed),
+          ", OutputOffset: ",
+          outputQueue_->header->producer_offset.load(std::memory_order_relaxed),
+          ", BytesAvailable: ", inputQueue_->getReadableBytes());
+
       // Write a zero to output to unblock runner and advance consumer minimally
+      LOG_INFO("Writing emergency 0 to output after exception");
       writeOutput(true, frameCounter);
       inputQueue_->advanceConsumer(SharedQueue::align8(8));
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
@@ -871,7 +1004,18 @@ void FrameProcessor::runQueue() {
       consecutiveErrors++;
       LOG_ERROR("Caught unknown exception in frame processing loop ", "(frame ",
                 frameCounter, ", error #", consecutiveErrors, ")");
+
+      // Output more debug info when an error occurs
+      LOG_ERROR(
+          "DIAGNOSTIC: Unknown exception at frame ", frameCounter,
+          ", InputOffset: ",
+          inputQueue_->header->consumer_offset.load(std::memory_order_relaxed),
+          ", OutputOffset: ",
+          outputQueue_->header->producer_offset.load(std::memory_order_relaxed),
+          ", BytesAvailable: ", inputQueue_->getReadableBytes());
+
       // Write a zero to output to unblock runner and advance consumer minimally
+      LOG_INFO("Writing emergency 0 to output after unknown exception");
       writeOutput(true, frameCounter);
       inputQueue_->advanceConsumer(SharedQueue::align8(8));
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {

@@ -215,8 +215,6 @@ void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
 void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
   LOG_DEBUG("--- Started parsing snapshot message, data size=", size,
             " bytes ---");
-  LOG_DEBUG("Note: 'data' pointer has already been advanced past "
-            "SNAPSHOT_HEADER_SKIP bytes");
 
   dumpHexBytes(data, std::min(size, static_cast<size_t>(32)),
                "Beginning of snapshot content");
@@ -392,8 +390,6 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
 void ProtocolParser::parseUpdateMessage(const uint8_t *data, size_t size) {
   LOG_DEBUG("--- Started parsing update message, data size=", size,
             " bytes ---");
-  LOG_DEBUG("Note: 'data' pointer has already been advanced past "
-            "UPDATE_HEADER_SKIP bytes");
 
   dumpHexBytes(data, std::min(size, static_cast<size_t>(32)),
                "Beginning of update content");
@@ -639,21 +635,48 @@ const T *ProtocolParser::getFieldPtr(const uint8_t *data, size_t offset,
 // Detect message type from header without processing the full payload
 MessageType ProtocolParser::detectMessageType(const uint8_t *data,
                                               size_t size) {
-  if (!data || size < sizeof(FrameHeader)) {
-    LOG_TRACE("Cannot detect message type: data is null or size is too small");
+  // Add detailed error logging
+  if (!data) {
+    LOG_ERROR("detectMessageType: data pointer is NULL");
     return MessageType::UNKNOWN;
   }
 
-  const FrameHeader *frameHeader = reinterpret_cast<const FrameHeader *>(data);
-  uint8_t typeId = frameHeader->typeId;
+  if (size < sizeof(FrameHeader)) {
+    LOG_ERROR("detectMessageType: size too small: ", size, " < ",
+              sizeof(FrameHeader));
+    return MessageType::UNKNOWN;
+  }
 
-  if (typeId == static_cast<uint8_t>(MessageType::SNAPSHOT)) {
-    return MessageType::SNAPSHOT;
-  } else if (typeId == static_cast<uint8_t>(MessageType::UPDATE)) {
-    return MessageType::UPDATE;
-  } else {
-    LOG_TRACE("Unknown message type ID: 0x", std::hex, static_cast<int>(typeId),
-              std::dec);
+  try {
+    const FrameHeader *frameHeader =
+        reinterpret_cast<const FrameHeader *>(data);
+    uint8_t typeId = frameHeader->typeId;
+    uint16_t length = frameHeader->length;
+
+    LOG_DEBUG("detectMessageType: typeId=0x", std::hex,
+              static_cast<int>(typeId), std::dec, ", length=", length);
+
+    // Check for obviously corrupted length
+    if (length > 65535) {
+      LOG_ERROR("detectMessageType: Suspicious frame length (", length,
+                ") detected, likely corrupted");
+      return MessageType::UNKNOWN;
+    }
+
+    if (typeId == static_cast<uint8_t>(MessageType::SNAPSHOT)) {
+      return MessageType::SNAPSHOT;
+    } else if (typeId == static_cast<uint8_t>(MessageType::UPDATE)) {
+      return MessageType::UPDATE;
+    } else {
+      LOG_DEBUG("detectMessageType: Unknown message type ID: 0x", std::hex,
+                static_cast<int>(typeId), std::dec);
+      return MessageType::UNKNOWN;
+    }
+  } catch (const std::exception &e) {
+    LOG_ERROR("Exception in detectMessageType: ", e.what());
+    return MessageType::UNKNOWN;
+  } catch (...) {
+    LOG_ERROR("Unknown exception in detectMessageType");
     return MessageType::UNKNOWN;
   }
 }
