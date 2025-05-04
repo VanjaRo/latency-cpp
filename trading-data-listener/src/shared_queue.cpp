@@ -171,8 +171,7 @@ uint8_t *SharedQueue::getWritePtr() { return buffer + getWritePos(); }
 
 // Accepts bytes aligned to 8-byte boundary
 void SharedQueue::advanceProducer(uint32_t bytes) {
-  // bytes = SharedQueue::align8(bytes);
-  bytes = SharedQueue::align8(bytes); // Ensure 8-byte alignment
+  //   bytes = SharedQueue::align8(bytes); // Ensure 8-byte alignment
   std::atomic_fetch_add_explicit(&header->producer_offset, bytes,
                                  std::memory_order_release);
 }
