@@ -528,229 +528,85 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
 // Helper function to write output to the queue
 void FrameProcessor::writeOutput(bool isSnapshotOrError,
                                  uint64_t frameCounter) {
-  // Increment the write count member
+  // Sequence count + initial log
   writesCount_++;
-  LOG_DEBUG("[Frame ", frameCounter,
-            "] writeOutput called, writesCount=", writesCount_);
+  LOG_DEBUG("[Frame ", frameCounter, "] writeOutput seq=", writesCount_);
 
-  if (usePcap_) [[unlikely]] {
-    // PCAP direct mode: print output to stdout
+  // PCAP mode: print directly
+  if (usePcap_) {
     if (isSnapshotOrError) {
-      std::cout << 0 << std::endl;
+      std::cout << 0 << '\n';
     } else {
-      auto updatedInstruments = orderbookManager_.getUpdatedInstruments();
-      if (updatedInstruments.empty()) {
-        std::cout << 0 << std::endl;
+      auto updates = orderbookManager_.getUpdatedInstruments();
+      if (updates.empty()) {
+        std::cout << 0 << '\n';
       } else {
-        std::cout << updatedInstruments.size();
-        for (const auto &vwap : updatedInstruments) {
-          std::cout << " " << vwap.instrumentId << " " << vwap.numerator << " "
-                    << vwap.denominator;
+        std::cout << updates.size();
+        for (auto &u : updates) {
+          std::cout << ' ' << u.instrumentId << ' ' << u.numerator << ' '
+                    << u.denominator;
         }
-        std::cout << std::endl;
+        std::cout << '\n';
       }
       orderbookManager_.clearChangedVWAPs();
     }
     return;
   }
 
-  const size_t output_size_zero = sizeof(uint32_t);
-  const size_t output_size_result_triple = 3 * sizeof(uint32_t);
+  // Prepare payload vector (empty for snapshots/errors)
+  std::vector<OrderbookManager::VWAPResult> updates;
+  if (!isSnapshotOrError)
+    updates = orderbookManager_.getUpdatedInstruments();
 
-  if (isSnapshotOrError) {
-    // Write 0 for snapshot or error cases
-    LOG_DEBUG("[Frame ", frameCounter,
-              "] Preparing to write output: 0 (Snapshot/Error)");
+  uint32_t count = static_cast<uint32_t>(updates.size());
+  size_t headerSz = sizeof(count);
+  size_t bodySz = count * 3 * sizeof(uint32_t);
+  size_t totalSz = headerSz + bodySz;
 
-    // Check if we can write before entering the loop
-    bool canWriteNow = outputQueue_->canWrite(output_size_zero);
-    LOG_DEBUG("[Frame ", frameCounter,
-              "] Initial canWrite check: ", canWriteNow, " for ",
-              output_size_zero, " bytes");
-
-    int wait_cycles = 0;
-    while (!outputQueue_->canWrite(output_size_zero)) {
-      if (wait_cycles % 1000 ==
-          0) { // Reduced from 10000 to get earlier warnings
-        uint32_t prod = outputQueue_->header->producer_offset.load(
-            std::memory_order_relaxed);
-        uint32_t cons = outputQueue_->header->consumer_offset.load(
-            std::memory_order_relaxed);
-        LOG_WARN("[Frame ", frameCounter,
-                 "] Waiting to write 0 to output queue... (Prod:", prod,
-                 " Cons:", cons, ", Cycles:", wait_cycles, ")");
-      }
-      // unified backoff
-      backoffDelay(wait_cycles);
+  // Warn every WARN_LOG_INTERVAL backoff loops
+  constexpr int WARN_LOG_INTERVAL = 1024;
+  int backoff = 0;
+  while (!outputQueue_->canWrite(totalSz)) {
+    if ((backoff % WARN_LOG_INTERVAL) == 0) {
+      size_t free = outputQueue_->getWritableBytes();
+      LOG_WARN("[Frame ", frameCounter, "] backpressure: need ", totalSz,
+               " bytes, free ", free);
     }
-
-    LOG_DEBUG("[Frame ", frameCounter,
-              "] Output queue has space for 0. Writing...");
-    uint32_t *writePtr =
-        reinterpret_cast<uint32_t *>(outputQueue_->getWritePtr());
-    *writePtr = 0;
-    outputQueue_->advanceProducer(output_size_zero);
-    LOG_DEBUG("[Frame ", frameCounter, "] Wrote output: 0 (Snapshot/Error)");
-  } else {
-    // Get instruments that were updated in this frame and have valid orderbooks
-    auto updatedInstruments = orderbookManager_.getUpdatedInstruments();
-    LOG_DEBUG("[Frame ", frameCounter, "] Got ", updatedInstruments.size(),
-              " updated instruments");
-
-    if (updatedInstruments.empty()) {
-      // Write 0 if no updated instruments with valid orderbooks
-      LOG_DEBUG("[Frame ", frameCounter,
-                "] Preparing to write output: 0 (No updated instruments)");
-
-      // Check if we can write before entering the loop
-      bool canWriteNow = outputQueue_->canWrite(output_size_zero);
-      LOG_DEBUG("[Frame ", frameCounter,
-                "] Initial canWrite check: ", canWriteNow, " for ",
-                output_size_zero, " bytes");
-
-      int wait_cycles = 0;
-      while (!outputQueue_->canWrite(output_size_zero)) {
-        if (wait_cycles % 1000 ==
-            0) { // Reduced from 10000 to get earlier warnings
-          uint32_t prod = outputQueue_->header->producer_offset.load(
-              std::memory_order_relaxed);
-          uint32_t cons = outputQueue_->header->consumer_offset.load(
-              std::memory_order_relaxed);
-          LOG_WARN("[Frame ", frameCounter,
-                   "] Waiting to write 0 (no updated instruments) to output "
-                   "queue... (Prod:",
-                   prod, " Cons:", cons, ", Cycles:", wait_cycles, ")");
-        }
-        // unified backoff
-        backoffDelay(wait_cycles);
-      }
-
-      LOG_DEBUG("[Frame ", frameCounter,
-                "] Output queue has space for 0 (no updated instruments). "
-                "Writing...");
-      uint32_t *writePtr =
-          reinterpret_cast<uint32_t *>(outputQueue_->getWritePtr());
-      *writePtr = 0;
-      outputQueue_->advanceProducer(output_size_zero);
-      LOG_DEBUG("[Frame ", frameCounter,
-                "] Wrote output: 0 (No updated instruments)");
-    } else {
-      // Write all updated instruments' VWAPs
-      size_t totalBytesToWrite =
-          sizeof(uint32_t) +
-          updatedInstruments.size() * output_size_result_triple;
-
-      // Safety check: ensure we're writing something valid
-      if (totalBytesToWrite <= sizeof(uint32_t) ||
-          updatedInstruments.size() == 0) {
-        LOG_WARN("[Frame ", frameCounter,
-                 "] Invalid bytes to write calculation: ", totalBytesToWrite,
-                 " with ", updatedInstruments.size(),
-                 " instruments. Falling back to writing 0.");
-
-        // Fall back to writing 0
-        int wait_cycles = 0;
-        while (!outputQueue_->canWrite(output_size_zero)) {
-          backoffDelay(wait_cycles);
-        }
-        uint32_t *writePtr =
-            reinterpret_cast<uint32_t *>(outputQueue_->getWritePtr());
-        *writePtr = 0;
-        outputQueue_->advanceProducer(output_size_zero);
-        LOG_DEBUG("[Frame ", frameCounter,
-                  "] Wrote fallback 0 due to calculation inconsistency");
-        return;
-      }
-
-      LOG_DEBUG("[Frame ", frameCounter, "] Preparing to write ",
-                updatedInstruments.size(), " instrument VWAPs (",
-                totalBytesToWrite, " bytes)");
-
-      // Check if we can write before entering the loop
-      bool canWriteNow = outputQueue_->canWrite(totalBytesToWrite);
-      LOG_DEBUG("[Frame ", frameCounter,
-                "] Initial canWrite check: ", canWriteNow, " for ",
-                totalBytesToWrite, " bytes");
-
-      int wait_cycles = 0;
-      while (!outputQueue_->canWrite(totalBytesToWrite)) {
-        if (wait_cycles % 1000 ==
-            0) { // Reduced from 10000 to get earlier warnings
-          uint32_t prod = outputQueue_->header->producer_offset.load(
-              std::memory_order_relaxed);
-          uint32_t cons = outputQueue_->header->consumer_offset.load(
-              std::memory_order_relaxed);
-
-          // Calculate buffer usage percentages for better diagnostics
-          uint32_t bufferSize = outputQueue_->getBufferSize();
-          float usagePercent = 100.0f * (prod - cons) / bufferSize;
-
-          LOG_WARN("[Frame ", frameCounter, "] Waiting to write ",
-                   updatedInstruments.size(), " VWAPs (", totalBytesToWrite,
-                   " bytes) to output queue... (Prod:", prod, " Cons:", cons,
-                   ", Used: ", usagePercent, "%, Cycles:", wait_cycles, ")");
-        }
-        // unified backoff
-        backoffDelay(wait_cycles);
-      }
-
-      LOG_DEBUG("[Frame ", frameCounter, "] Output queue has space for ",
-                updatedInstruments.size(), " VWAPs. Writing...");
-
-      uint8_t *writePtr = outputQueue_->getWritePtr();
-      uint32_t count = static_cast<uint32_t>(updatedInstruments.size());
-      // Write count directly via pointer for speed
-      *reinterpret_cast<uint32_t *>(writePtr) = count;
-      writePtr += sizeof(uint32_t);
-
-      // Only log the number of VWAPs being written
-      LOG_DEBUG("[Frame ", frameCounter, "] Writing ", count, " VWAP values");
-
-      // In detailed trace mode, identify VWAP updates for this frame
-      if (COMPILE_TIME_LOG_LEVEL >= static_cast<int>(LogLevel::TRACE)) {
-        int updatedCount = 0;
-
-        // Count once to avoid repeating the isVWAPChanged check
-        for (const auto &vwap : updatedInstruments) {
-          if (orderbookManager_.isVWAPChanged(vwap.instrumentId)) {
-            updatedCount++;
-            LOG_TRACE("  -> Updated VWAP: ID:", vwap.instrumentId,
-                      " N:", vwap.numerator, " D:", vwap.denominator);
-          }
-        }
-
-        if (updatedCount > 0) {
-          LOG_TRACE("[Frame ", frameCounter, "] Of ", count,
-                    " updated instruments, ", updatedCount,
-                    " had value updates in this frame");
-        } else {
-          LOG_TRACE(
-              "[Frame ", frameCounter, "] All ", count,
-              " instruments were updated but none had value changes in this "
-              "frame");
-        }
-      }
-
-      // Write the actual data
-      for (const auto &vwap : updatedInstruments) {
-        // Write VWAP fields directly via pointer for speed
-        *reinterpret_cast<uint32_t *>(writePtr) = vwap.instrumentId;
-        writePtr += sizeof(uint32_t);
-        *reinterpret_cast<uint32_t *>(writePtr) = vwap.numerator;
-        writePtr += sizeof(uint32_t);
-        *reinterpret_cast<uint32_t *>(writePtr) = vwap.denominator;
-        writePtr += sizeof(uint32_t);
-      }
-
-      outputQueue_->advanceProducer(totalBytesToWrite);
-      LOG_DEBUG("[Frame ", frameCounter, "] Advanced output producer by ",
-                totalBytesToWrite);
-    }
-    // We still clear the VWAP changed flags after writing
-    orderbookManager_.clearChangedVWAPs();
+    backoffDelay(backoff);
   }
-  LOG_DEBUG("[Frame ", frameCounter,
-            "] writeOutput completed successfully, writesCount=", writesCount_);
+
+  // Write count and entries
+  uint8_t *wptr = outputQueue_->getWritePtr();
+  *reinterpret_cast<uint32_t *>(wptr) = count;
+  wptr += headerSz;
+  LOG_DEBUG("[Frame ", frameCounter, "] writing ", count, " entries (", totalSz,
+            " bytes)");
+
+  // Trace-only detailed logs
+  if (COMPILE_TIME_LOG_LEVEL >= static_cast<int>(LogLevel::TRACE)) {
+    for (auto &u : updates) {
+      if (orderbookManager_.isVWAPChanged(u.instrumentId)) {
+        LOG_TRACE("[Frame ", frameCounter, "] VWAP ID=", u.instrumentId,
+                  " N=", u.numerator, " D=", u.denominator);
+      }
+    }
+  }
+
+  // Copy payload (ID, numerator, denominator triples)
+  for (auto &u : updates) {
+    *reinterpret_cast<uint32_t *>(wptr) = u.instrumentId;
+    wptr += sizeof(uint32_t);
+    *reinterpret_cast<uint32_t *>(wptr) = u.numerator;
+    wptr += sizeof(uint32_t);
+    *reinterpret_cast<uint32_t *>(wptr) = u.denominator;
+    wptr += sizeof(uint32_t);
+  }
+
+  // Publish
+  outputQueue_->advanceProducer(totalSz);
+  orderbookManager_.clearChangedVWAPs();
+  LOG_DEBUG("[Frame ", frameCounter, "] writeOutput done, wrote ", count,
+            " entries");
 }
 
 // Helper function to process a valid packet's payload
