@@ -614,6 +614,30 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
       size_t totalBytesToWrite =
           sizeof(uint32_t) +
           updatedInstruments.size() * output_size_result_triple;
+
+      // Safety check: ensure we're writing something valid
+      if (totalBytesToWrite <= sizeof(uint32_t) ||
+          updatedInstruments.size() == 0) {
+        LOG_WARN("[Frame ", frameCounter,
+                 "] Invalid bytes to write calculation: ", totalBytesToWrite,
+                 " with ", updatedInstruments.size(),
+                 " instruments. Falling back to writing 0.");
+
+        // Fall back to writing 0
+        int wait_cycles = 0;
+        while (!outputQueue_->canWrite(output_size_zero)) {
+          backoffDelay(wait_cycles);
+          wait_cycles++;
+        }
+        uint32_t *writePtr =
+            reinterpret_cast<uint32_t *>(outputQueue_->getWritePtr());
+        *writePtr = 0;
+        outputQueue_->advanceProducer(output_size_zero);
+        LOG_DEBUG("[Frame ", frameCounter,
+                  "] Wrote fallback 0 due to calculation inconsistency");
+        return;
+      }
+
       LOG_TRACE("[Frame ", frameCounter, "] Preparing to write ",
                 updatedInstruments.size(), " instrument VWAPs (",
                 totalBytesToWrite, " bytes)");
@@ -698,6 +722,25 @@ bool FrameProcessor::processPacketPayload(const PacketInfo &packetInfo,
     return true; // Error
   }
 
+  // Additional validation to catch suspicious payload lengths
+  const size_t MIN_VALID_PAYLOAD =
+      sizeof(FrameHeader); // At minimum, should have a frame header
+  const size_t MAX_REASONABLE_PAYLOAD = 65535; // Standard UDP max size
+
+  if (packetInfo.payloadLength < MIN_VALID_PAYLOAD) {
+    LOG_ERROR("[Frame ", frameCounter,
+              "] Payload too small to contain a valid message: ",
+              packetInfo.payloadLength, " < ", MIN_VALID_PAYLOAD);
+    return true; // Error
+  }
+
+  if (packetInfo.payloadLength > MAX_REASONABLE_PAYLOAD) {
+    LOG_ERROR("[Frame ", frameCounter,
+              "] Suspiciously large payload: ", packetInfo.payloadLength, " > ",
+              MAX_REASONABLE_PAYLOAD);
+    return true; // Error
+  }
+
   bool processingError = false;
 
   try {
@@ -770,15 +813,17 @@ void FrameProcessor::processSingleFrame(uint64_t frameCounter) {
   // 4. Determine if this is a snapshot message by asking the protocol parser
   MessageType msgType = ProtocolParser::detectMessageType(
       packetInfo.payload, packetInfo.payloadLength);
-  bool isSnapshotMessage = (msgType == MessageType::SNAPSHOT);
+  bool zeroWriteMessage =
+      (msgType == MessageType::SNAPSHOT || msgType == MessageType::UNKNOWN);
 
   LOG_DEBUG("[Frame ", frameCounter, "] Processing error: ", processingError,
             " messageType: ", static_cast<int>(msgType),
-            " isSnapshot: ", isSnapshotMessage);
+            " zeroWrite: ", zeroWriteMessage);
 
   // 5. Write Output
-  // Write 0 if it was a snapshot message OR if a processing error occurred
-  writeOutput(isSnapshotMessage || processingError, frameCounter);
+  // Write 0 if it was a snapshot message OR unknown message type OR if a
+  // processing error occurred
+  writeOutput(zeroWriteMessage || processingError, frameCounter);
 
   // 6. Advance Input Queue Consumer
   advanceInputQueue(packetInfo, frameCounter);
