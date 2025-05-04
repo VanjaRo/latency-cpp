@@ -1,6 +1,7 @@
 #include "frame_processor.h"
 #include "protocol_logger.h"
 #include "shared_queue.h"
+#include <cstdint>
 #include <emmintrin.h>
 #include <iostream> // For PCAP direct mode output
 
@@ -527,8 +528,11 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
 // Helper function to write output to the queue
 void FrameProcessor::writeOutput(bool isSnapshotOrError,
                                  uint64_t frameCounter) {
+
+  static uint64_t writesCount = 0;
+
   LOG_DEBUG("[Frame ", frameCounter,
-            "] writeOutput called, isSnapshotOrError=", isSnapshotOrError);
+            "] writeOutput called, writesCount=", writesCount);
 
   if (usePcap_) [[unlikely]] {
     // PCAP direct mode: print output to stdout
@@ -746,7 +750,8 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
     // We still clear the VWAP changed flags after writing
     orderbookManager_.clearChangedVWAPs();
   }
-  LOG_DEBUG("[Frame ", frameCounter, "] writeOutput completed successfully");
+  LOG_DEBUG("[Frame ", frameCounter,
+            "] writeOutput completed successfully, writesCount=", writesCount);
 }
 
 // Helper function to process a valid packet's payload
