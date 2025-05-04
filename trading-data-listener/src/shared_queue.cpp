@@ -154,7 +154,7 @@ size_t SharedQueue::getReadableBytes() const {
   // corruption.
   if (consumer > producer) {
     // Log the anomaly
-    LOG_ERROR("Consumer offset (", consumer, ") is ahead of producer offset (",
+    LOG_TRACE("Consumer offset (", consumer, ") is ahead of producer offset (",
               producer,
               "). This should never happen. Returning 0 bytes available.");
     return 0; // Return 0 to indicate no bytes are available
