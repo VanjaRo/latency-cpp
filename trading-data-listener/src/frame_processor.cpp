@@ -830,6 +830,9 @@ void FrameProcessor::advanceInputQueue(const PacketInfo &packetInfo,
 
 // Helper function to process a single frame from the input queue
 void FrameProcessor::processSingleFrame(uint64_t frameCounter) {
+  // Update the current frame counter in the logger
+  SET_LOG_FRAME(frameCounter);
+
   LOG_DEBUG("[Frame ", frameCounter, "] ----- Start Processing -----");
 
   // 1. Parse the next packet (network level)
@@ -893,6 +896,13 @@ void FrameProcessor::processSingleFrame(uint64_t frameCounter) {
 // Main processing loop for Queue mode
 void FrameProcessor::runQueue() {
   LOG_INFO("Starting frame processing loop (Queue mode).");
+
+  // Set logging to start after frame 5000 - adjust this number as needed for
+  // your CI environment This will skip logging for the first 5000 frames to
+  // save buffer space
+  SET_LOG_FRAME_THRESHOLD(133699);
+  LOG_INFO("Log threshold set to frame 5000. Logs before this will be "
+           "suppressed except for errors.");
 
   // Check for null queue pointers
   if (!inputQueue_ || !outputQueue_) {
