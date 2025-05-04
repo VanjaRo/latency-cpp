@@ -122,9 +122,10 @@ void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
     // Check if the entire message fits within the available data
     size_t header_and_message_size = sizeof(FrameHeader) + header->length;
     if (current_offset + header_and_message_size > size) {
-      LOG_ERROR("Incomplete message: offset=", current_offset,
+      LOG_DEBUG("Incomplete message: offset=", current_offset,
                 " needed=", header_and_message_size, " available=", size);
-      throw std::runtime_error("Incomplete message in UDP payload");
+      // finish processing current message
+      return;
     }
 
     const uint8_t *messageData = data + current_offset + sizeof(FrameHeader);
@@ -160,9 +161,9 @@ void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
     }
     case MessageType::UPDATE: {
       if (messageSize < UPDATE_HEADER_SKIP) {
-        LOG_ERROR("Update message too short after header skip: ", messageSize,
+        LOG_DEBUG("Update message too short after header skip: ", messageSize,
                   " bytes < ", UPDATE_HEADER_SKIP, " bytes");
-        throw std::runtime_error("Update message too short after header skip");
+        return;
       }
       LOG_DEBUG("Update message: skipping additional ", UPDATE_HEADER_SKIP,
                 " bytes of header");
