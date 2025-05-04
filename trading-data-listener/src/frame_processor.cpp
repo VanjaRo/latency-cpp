@@ -528,11 +528,10 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
 // Helper function to write output to the queue
 void FrameProcessor::writeOutput(bool isSnapshotOrError,
                                  uint64_t frameCounter) {
-
-  static uint64_t writesCount = 0;
-
+  // Increment the write count member
+  writesCount_++;
   LOG_DEBUG("[Frame ", frameCounter,
-            "] writeOutput called, writesCount=", writesCount);
+            "] writeOutput called, writesCount=", writesCount_);
 
   if (usePcap_) [[unlikely]] {
     // PCAP direct mode: print output to stdout
@@ -751,7 +750,7 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
     orderbookManager_.clearChangedVWAPs();
   }
   LOG_DEBUG("[Frame ", frameCounter,
-            "] writeOutput completed successfully, writesCount=", writesCount);
+            "] writeOutput completed successfully, writesCount=", writesCount_);
 }
 
 // Helper function to process a valid packet's payload

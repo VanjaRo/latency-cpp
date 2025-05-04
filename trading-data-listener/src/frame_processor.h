@@ -137,6 +137,8 @@ private:
   uint32_t snapshotIP_ = 0; // Used for filtering packets
   uint32_t updateIP_ = 0;   // Used for filtering packets
   std::set<std::string> targetInstruments_;
+  // Tracks the number of times writeOutput has been called
+  uint64_t writesCount_ = 0;
 
   // Helper function to load metadata (IPs and instruments)
   bool loadMetadata();
