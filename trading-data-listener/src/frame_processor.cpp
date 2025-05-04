@@ -815,7 +815,7 @@ void FrameProcessor::processSingleFrame(uint64_t frameCounter) {
   bool zeroWriteMessage =
       (msgType == MessageType::SNAPSHOT || msgType == MessageType::UNKNOWN);
 
-  LOG_DEBUG("[Frame ", frameCounter, "] Processing error: ", processingError,
+  LOG_TRACE("[Frame ", frameCounter, "] Processing error: ", processingError,
             " messageType: ", static_cast<int>(msgType),
             " zeroWrite: ", zeroWriteMessage);
 
