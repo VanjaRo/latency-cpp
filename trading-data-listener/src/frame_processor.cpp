@@ -855,42 +855,21 @@ void FrameProcessor::processSingleFrame(uint64_t frameCounter) {
   }
 
   // 3. Process payload (application level)
-  LOG_DEBUG("[Frame ", frameCounter, "] Step 3: Processing packet payload");
   bool processingError = processPacketPayload(packetInfo, frameCounter);
-  LOG_DEBUG("[Frame ", frameCounter,
-            "] Payload processed, error=", processingError);
 
   // 4. Determine if this is a snapshot message by asking the protocol parser
-  LOG_DEBUG("[Frame ", frameCounter, "] Step 4: Detecting message type");
   MessageType msgType = ProtocolParser::detectMessageType(
       packetInfo.payload, packetInfo.payloadLength);
-  bool isSnapshotMessage = (msgType == MessageType::SNAPSHOT);
-  bool isUnknownMessage = (msgType == MessageType::UNKNOWN);
-  bool isUpdateMessage = (msgType == MessageType::UPDATE);
-
-  LOG_DEBUG("[Frame ", frameCounter,
-            "] Message type=", static_cast<int>(msgType), " (",
-            isSnapshotMessage  ? "SNAPSHOT"
-            : isUpdateMessage  ? "UPDATE"
-            : isUnknownMessage ? "UNKNOWN"
-                               : "INVALID",
-            "), processingError=", processingError);
+  bool writeZeroMsgType =
+      (msgType == MessageType::SNAPSHOT || msgType == MessageType::UNKNOWN);
 
   // 5. Write Output
-  LOG_DEBUG("[Frame ", frameCounter, "] Step 5: Writing to output. WriteZero=",
-            (isSnapshotMessage || isUnknownMessage || processingError));
   // Write 0 if it was a snapshot message OR unknown message type OR if a
   // processing error occurred
-  writeOutput(isSnapshotMessage || isUnknownMessage || processingError,
-              frameCounter);
-  LOG_DEBUG("[Frame ", frameCounter, "] Output written successfully");
+  writeOutput(writeZeroMsgType || processingError, frameCounter);
 
   // 6. Advance Input Queue Consumer
-  LOG_DEBUG("[Frame ", frameCounter, "] Step 6: Advancing input queue");
   advanceInputQueue(packetInfo, frameCounter);
-  LOG_DEBUG("[Frame ", frameCounter, "] Input queue advanced");
-
-  LOG_DEBUG("[Frame ", frameCounter, "] ----- End Processing (Success) -----");
 }
 
 // Main processing loop for Queue mode
