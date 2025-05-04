@@ -216,35 +216,17 @@ void ProtocolParser::parseSnapshotMessage(const uint8_t *data, size_t size) {
   dumpHexBytes(data, std::min(size, static_cast<size_t>(32)),
                "Beginning of snapshot content");
 
-  // Bulk skip of known snapshot prefix: six fixed non-instrument fields
+  // Skip preceding fields until the first INSTRUMENT_INFO field
   size_t offset = 0;
-  {
-    // Snapshot prefix: field_ids = {0x0032,0x0031,0x1001,0x1003,0x1002,0x1004}
-    // lengths = {9,22,6,37,22,4}
-    static constexpr size_t PREFIX_FIELDS = 6;
-    static constexpr uint16_t prefixIds[PREFIX_FIELDS] = {
-        0x0032, 0x0031, 0x1001, 0x1003, 0x1002, 0x1004};
-    static constexpr uint16_t prefixLens[PREFIX_FIELDS] = {9, 22, 6, 37, 22, 4};
-    static constexpr size_t SNAPSHOT_PREFIX_SIZE =
-        PREFIX_FIELDS * sizeof(FieldHeader) + (9 + 22 + 6 + 37 + 22 + 4);
-    if (size >= SNAPSHOT_PREFIX_SIZE) {
-      size_t tmpOff = 0;
-      bool match = true;
-      for (size_t i = 0; i < PREFIX_FIELDS; ++i) {
-        const FieldHeader *h = getFieldPtr<FieldHeader>(data, tmpOff, size);
-        if (h->fieldId != prefixIds[i] || h->fieldLen != prefixLens[i]) {
-          match = false;
-          break;
-        }
-        tmpOff += sizeof(FieldHeader) + h->fieldLen;
-      }
-      if (match) {
-        LOG_TRACE(
-            "Fast-forwarded past known snapshot prefix: skipped %zu bytes",
-            tmpOff);
-        offset = tmpOff;
-      }
+  while (offset + sizeof(FieldHeader) <= size) {
+    FieldHeader hdr;
+    std::memcpy(&hdr, data + offset, sizeof(hdr));
+    if (hdr.fieldId ==
+        static_cast<uint16_t>(SnapshotFieldId::INSTRUMENT_INFO)) {
+      break; // found the instrument info start
     }
+    // Skip this field header and its payload
+    offset += sizeof(FieldHeader) + hdr.fieldLen;
   }
   int32_t currentInstrumentId = -1;
   // Pointer-driven field parsing

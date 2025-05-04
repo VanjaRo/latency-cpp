@@ -204,7 +204,8 @@ void FrameProcessor::backoffDelay(int &counter) {
 FrameProcessor::PacketInfo
 FrameProcessor::parseNextPacket(uint64_t frameCounter) {
   PacketInfo info;
-  const size_t min_eth_alignment = 8; // Check alignment boundary
+  const size_t min_eth_alignment =
+      sizeof(EthernetHeader); // Full Ethernet header size
   const size_t min_ip_header_size =
       sizeof(EthernetHeader) + sizeof(IPv4Header); // Eth=14, IPv4=20 -> 34
   const int max_retries =
