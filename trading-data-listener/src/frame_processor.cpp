@@ -757,7 +757,7 @@ void FrameProcessor::processSingleFrame(uint64_t frameCounter) {
   PacketInfo packetInfo = parseNextPacket(frameCounter);
 
   // 2. Handle invalid/skipped packets - write 0 to output and advance
-  if (true) {
+  if (!packetInfo.valid) {
     LOG_DEBUG("[Frame ", frameCounter, "] Invalid packet, writing 0 to output");
     writeOutput(true, frameCounter); // Write 0 for invalid packets
     advanceInputQueue(packetInfo, frameCounter);
