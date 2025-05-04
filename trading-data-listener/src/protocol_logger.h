@@ -30,9 +30,10 @@ constexpr LogLevel CT_LOG_LEVEL = static_cast<LogLevel>(COMPILE_TIME_LOG_LEVEL);
 
 class ProtocolLogger {
 public:
-  // Static frame counter and threshold
-  static std::atomic<uint64_t> currentFrame;
-  static uint64_t frameThreshold;
+  // Static frame counter and threshold - using inline to avoid multiple
+  // definition errors
+  inline static std::atomic<uint64_t> currentFrame{0};
+  inline static uint64_t frameThreshold{LOG_FRAME_THRESHOLD};
 
   // Update the current frame
   static void setCurrentFrame(uint64_t frame) {
@@ -91,9 +92,9 @@ public:
 private:
 };
 
-// Initialize static members
-std::atomic<uint64_t> ProtocolLogger::currentFrame{0};
-uint64_t ProtocolLogger::frameThreshold{LOG_FRAME_THRESHOLD};
+// Initialize static members - REMOVE THESE LINES TO FIX MULTIPLE DEFINITIONS
+// std::atomic<uint64_t> ProtocolLogger::currentFrame{0};
+// uint64_t ProtocolLogger::frameThreshold{LOG_FRAME_THRESHOLD};
 
 // Logging macros - Conditionally compile the log call
 #define LOG_IMPL(level, ...)                                                   \

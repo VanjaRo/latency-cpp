@@ -901,7 +901,7 @@ void FrameProcessor::runQueue() {
   // your CI environment This will skip logging for the first 5000 frames to
   // save buffer space
   SET_LOG_FRAME_THRESHOLD(133699);
-  LOG_INFO("Log threshold set to frame 5000. Logs before this will be "
+  LOG_INFO("Log threshold set to frame 133699. Logs before this will be "
            "suppressed except for errors.");
 
   // Check for null queue pointers
