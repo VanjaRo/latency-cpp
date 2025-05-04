@@ -48,8 +48,8 @@ constexpr size_t INSTRUMENT_INFO_TOTAL_LEN =
     INSTRUMENT_NAME_LEN + INSTRUMENT_UNUSED_LEN + INSTRUMENT_TICK_SIZE_LEN +
     INSTRUMENT_REFERENCE_PRICE_LEN + INSTRUMENT_ID_LEN; // Should be 112
 
-#ifndef NDEBUG
-// Helper function to dump hex bytes for debugging
+#if COMPILE_TIME_LOG_LEVEL >= 5
+// Helper function to dump hex bytes for trace-level debugging
 void ProtocolParser::dumpHexBytes(const uint8_t *data, size_t size,
                                   const char *prefix) {
   constexpr size_t MAX_DUMP = 64; // Maximum bytes to dump
@@ -71,13 +71,17 @@ void ProtocolParser::dumpHexBytes(const uint8_t *data, size_t size,
     oss << "... (" << (size - MAX_DUMP) << " more bytes)";
   }
 
-  LOG_DEBUG(oss.str());
+  LOG_TRACE(oss.str());
 }
+#else
+// Empty implementation for when trace logging is disabled
+inline void ProtocolParser::dumpHexBytes(const uint8_t *, size_t,
+                                         const char *) {}
 #endif
 
 void ProtocolParser::parsePayload(const uint8_t *data, size_t size) {
   size_t current_offset = 0; // Need an offset to track position
-  LOG_DEBUG("Starting to parse UDP payload of size ", size, " bytes");
+  LOG_TRACE("Starting to parse UDP payload of size ", size, " bytes");
   dumpHexBytes(data, std::min(size, static_cast<size_t>(32)),
                "Payload starts with");
 

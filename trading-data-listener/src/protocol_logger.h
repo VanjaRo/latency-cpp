@@ -24,13 +24,11 @@ constexpr LogLevel CT_LOG_LEVEL = static_cast<LogLevel>(COMPILE_TIME_LOG_LEVEL);
 
 class ProtocolLogger {
 public:
-  template <typename... Args>
-  static void log(LogLevel level, const char *file, int line, Args... args) {
+  template <typename... Args> static void log(LogLevel level, Args... args) {
     // Compile-time check remains the primary optimization
     if (static_cast<int>(level) <= COMPILE_TIME_LOG_LEVEL) {
       std::ostringstream oss;
-      oss << "[" << levelToString(level) << "] " << file << ":" << line
-          << " - ";
+      oss << "[" << levelToString(level) << "] ";
       // Use fold expression to append all arguments to the ostringstream
       (oss << ... << args);
       oss << '\n'; // Add newline
@@ -66,7 +64,7 @@ private:
 #define LOG_IMPL(level, ...)                                                   \
   do {                                                                         \
     if (static_cast<int>(level) <= COMPILE_TIME_LOG_LEVEL) {                   \
-      ProtocolLogger::log(level, __FILE__, __LINE__, __VA_ARGS__);             \
+      ProtocolLogger::log(level, __VA_ARGS__);                                 \
     }                                                                          \
   } while (0)
 
