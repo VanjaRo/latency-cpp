@@ -28,7 +28,8 @@ uint32_t FrameProcessor::ipStringToUint32(const std::string &ip_str) {
   return addr.s_addr;
 }
 
-constexpr uint32_t ETHERNET_FCS_LENGTH = 4;
+// There is no FCS in the shared-memory feed, so drop any extra length
+constexpr uint32_t ETHERNET_FCS_LENGTH = 0;
 
 // Load metadata (implementation moved here)
 bool FrameProcessor::loadMetadata() {
@@ -378,8 +379,7 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
   }
 
   // 6. Calculate required frame size and wait for it
-  info.frameSize =
-      sizeof(EthernetHeader) + info.ipTotalLength + ETHERNET_FCS_LENGTH;
+  info.frameSize = sizeof(EthernetHeader) + info.ipTotalLength; // no FCS added
   info.alignedFrameSize = SharedQueue::align8(info.frameSize);
   LOG_TRACE("[Frame ", frameCounter, "] Calculated frameSize=", info.frameSize,
             ", alignedFrameSize=", info.alignedFrameSize);
@@ -470,8 +470,7 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
       // Boundary check: Ensure payload doesn't read past the received frame
       // data
       const uint8_t *frameEndBasedOnIp =
-          info.rawDataStart + info.frameSize -
-          ETHERNET_FCS_LENGTH; // End of IP payload
+          info.rawDataStart + info.frameSize; // End of IP payload
       const uint8_t *payloadEnd = info.payload + info.payloadLength;
 
       if (payloadEnd > frameEndBasedOnIp) {
