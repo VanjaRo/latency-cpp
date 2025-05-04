@@ -876,12 +876,7 @@ void FrameProcessor::processSingleFrame(uint64_t frameCounter) {
 void FrameProcessor::runQueue() {
   LOG_INFO("Starting frame processing loop (Queue mode).");
 
-  // Set logging to start after frame 5000 - adjust this number as needed for
-  // your CI environment This will skip logging for the first 5000 frames to
-  // save buffer space
-  SET_LOG_FRAME_THRESHOLD(133699);
-  LOG_INFO("Log threshold set to frame 133699. Logs before this will be "
-           "suppressed except for errors.");
+  SET_LOG_FRAME_THRESHOLD(134050);
 
   // Check for null queue pointers
   if (!inputQueue_ || !outputQueue_) {
