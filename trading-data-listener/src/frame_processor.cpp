@@ -627,7 +627,6 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
         int wait_cycles = 0;
         while (!outputQueue_->canWrite(output_size_zero)) {
           backoffDelay(wait_cycles);
-          wait_cycles++;
         }
         uint32_t *writePtr =
             reinterpret_cast<uint32_t *>(outputQueue_->getWritePtr());
