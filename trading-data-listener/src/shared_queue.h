@@ -18,7 +18,7 @@ class SharedQueue {
 
 public:
   // Align bytes to 8-byte boundary (made public and static)
-  static uint32_t align8(uint32_t bytes) { return (bytes + 7) & ~7; }
+  static constexpr uint32_t align8(uint32_t bytes) { return (bytes + 7) & ~7; }
 
   // Constructor for input queue (consumer)
   SharedQueue(const std::string &headerPath, const std::string &bufferPath,

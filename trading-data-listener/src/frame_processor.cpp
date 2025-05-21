@@ -6,14 +6,39 @@
 #include <iostream> // For PCAP direct mode output
 
 #include <arpa/inet.h> // For ntohs, ntohl, inet_pton
-#include <chrono>
-#include <cstring> // For memcpy
+#include <cstring>     // For memset
 #include <fstream>
-#include <immintrin.h>
 #include <netinet/if_ether.h> // Include for ETHERTYPE_IP
 #include <sstream>
 #include <stdexcept>
-#include <thread>
+
+// Ethernet constants
+constexpr size_t ETHERNET_FCS_LENGTH =
+    4; // Standard Ethernet Frame Check Sequence length.
+
+// Define constants for minimum Ethernet frame size calculation when skipping
+// non-IP frames. An Ethernet frame must be at least 60 bytes before the FCS, or
+// 64 bytes with the FCS. Minimum payload to achieve 60 bytes (before FCS) = 60
+// bytes - sizeof(EthernetHeader) sizeof(EthernetHeader) is 14 bytes (6 DstMAC +
+// 6 SrcMAC + 2 EtherType). So, MINIMUM_ETHERNET_PAYLOAD_FOR_PADDING = 60 - 14 =
+// 46 bytes.
+constexpr size_t MINIMUM_ETHERNET_PAYLOAD_FOR_PADDING = 46;
+constexpr size_t MINIMUM_ALIGNED_ETH_FRAME_SIZE_FOR_SKIP =
+    sizeof(EthernetHeader) + MINIMUM_ETHERNET_PAYLOAD_FOR_PADDING +
+    ETHERNET_FCS_LENGTH;
+// This evaluates to 14 (Eth Header) + 46 (Min Payload) + 4 (FCS) = 64 bytes.
+// This value is already 8-byte aligned.
+
+// Constant for minimal advancement of the queue consumer on critical parsing
+// errors.
+constexpr size_t MINIMAL_ALIGNED_ADVANCE_ON_ERROR =
+    SharedQueue::align8(sizeof(EthernetHeader)); // 16 bytes
+
+// Helper to apply unified spin/yield/sleep backoff
+static inline void backoffDelay(int &counter) {
+  _mm_pause();
+  ++counter;
+}
 
 // The global ipStringToUint32 function is now always defined in pcap_reader.cpp
 
@@ -27,9 +52,6 @@ uint32_t FrameProcessor::ipStringToUint32(const std::string &ip_str) {
   // for comparison with packet headers.
   return addr.s_addr;
 }
-
-// There is no FCS in the shared-memory feed, so drop any extra length
-constexpr uint32_t ETHERNET_FCS_LENGTH = 0;
 
 // Load metadata (implementation moved here)
 bool FrameProcessor::loadMetadata() {
@@ -200,46 +222,31 @@ bool FrameProcessor::waitForBytes(size_t requiredBytes,
   return true;
 }
 
-// Helper to apply unified spin/yield/sleep backoff
-void FrameProcessor::backoffDelay(int &counter) {
-  _mm_pause();
-  ++counter;
-}
+// --- Implementation of new private helper methods for parsing ---
 
-// Helper function to parse the next packet from the input queue
-FrameProcessor::PacketInfo
-FrameProcessor::parseNextPacket(uint64_t frameCounter) {
-  PacketInfo info;
-  const size_t min_alignment = 8;
-  const size_t min_eth_header_alignment =
-      SharedQueue::align8(sizeof(EthernetHeader));
-  const size_t min_ip_header_size =
-      sizeof(EthernetHeader) + sizeof(IPv4Header); // Eth=14, IPv4=20 -> 34
-  const int max_retries =
-      15; // Maximum number of retry attempts before giving up
+bool FrameProcessor::parseEthernetHeader(PacketInfo &info,
+                                         uint64_t frameCounter) {
+  const size_t MINIMAL_ALIGNED_ADVANCE_ON_ERROR =
+      SharedQueue::align8(sizeof(EthernetHeader)); // 16 bytes
   int retry_count = 0;
+  const int max_retries = 15;
 
   // 1. Wait for minimum Ethernet alignment data
   while (!waitForBytes(sizeof(EthernetHeader), frameCounter, "ETH_ALIGN")) {
     LOG_WARN("[Frame ", frameCounter, "] waitForBytes failed (attempt ",
              retry_count, ") while waiting for ETH_ALIGN. Will keep waiting.");
-
     if (retry_count >= max_retries) {
       LOG_ERROR("[Frame ", frameCounter,
                 "] Multiple waitForBytes failures for ETH_ALIGN. Returning "
                 "invalid packet.");
       info.valid = false;
-      info.alignedFrameSize =
-          min_alignment; // Set size to advance by minimal amount
-      return info;
+      info.alignedFrameSize = MINIMAL_ALIGNED_ADVANCE_ON_ERROR;
+      return false;
     }
-
-    // unified backoff before retrying
     backoffDelay(retry_count);
   }
 
-  info.bytesAvailableWhenParsed =
-      inputQueue_->getReadableBytes(); // Initial read
+  info.bytesAvailableWhenParsed = inputQueue_->getReadableBytes();
 
   // 2. Peek at Ethernet Header
   info.rawDataStart = inputQueue_->getReadPtr();
@@ -248,12 +255,11 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
               "] getReadPtr() returned nullptr after ETH_ALIGN wait! Returning "
               "invalid packet.");
     info.valid = false;
-    info.alignedFrameSize = min_alignment;
-    return info;
+    info.alignedFrameSize = MINIMAL_ALIGNED_ADVANCE_ON_ERROR;
+    return false;
   }
   info.ethHeader = reinterpret_cast<const EthernetHeader *>(info.rawDataStart);
 
-  //   Debug ethernet header print
   LOG_DEBUG("[Frame ", frameCounter,
             "] Ethernet header: ", "Source MAC: ", info.ethHeader->srcMac,
             "Destination MAC: ", info.ethHeader->destMac,
@@ -268,43 +274,48 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
               "] Exception accessing etherType: ", e.what(),
               " Returning invalid packet.");
     info.valid = false;
-    info.alignedFrameSize = min_eth_header_alignment;
-    return info;
+    info.alignedFrameSize = MINIMAL_ALIGNED_ADVANCE_ON_ERROR;
+    return false;
   } catch (...) {
     LOG_ERROR("[Frame ", frameCounter,
               "] Unknown exception accessing etherType. Possible corrupted "
               "buffer. Returning invalid packet.");
     info.valid = false;
-    info.alignedFrameSize = min_eth_header_alignment;
-    return info;
+    info.alignedFrameSize = MINIMAL_ALIGNED_ADVANCE_ON_ERROR;
+    return false;
   }
 
-  // 3. Handle non-IP frames
+  // 3. Handle non-IP frames (this is a valid skip, not an error)
   if (info.etherType != ETHERTYPE_IP) {
     LOG_WARN("[Frame ", frameCounter, "] Skipping non-IP frame (EtherType: 0x",
              std::hex, info.etherType, std::dec, ")");
     info.valid = false; // Mark as invalid/skip
-    info.alignedFrameSize =
-        min_eth_header_alignment; // Set size to advance by minimal amount
-    return info;
+    info.alignedFrameSize = MINIMUM_ALIGNED_ETH_FRAME_SIZE_FOR_SKIP;
+    return false; // Indicates packet should be skipped
   }
+  return true; // Successfully parsed Ethernet header for an IP packet
+}
 
-  // 4. Wait for full Ethernet + minimum IP header
-  retry_count = 0;
-  while (!waitForBytes(min_ip_header_size, frameCounter, "IP_HEADER")) {
+bool FrameProcessor::parseIpHeader(PacketInfo &info, uint64_t frameCounter) {
+  const size_t MINIMAL_ALIGNED_ADVANCE_ON_ERROR =
+      SharedQueue::align8(sizeof(EthernetHeader)); // 16 bytes
+  const size_t min_ip_header_and_eth_size =
+      sizeof(EthernetHeader) + sizeof(IPv4Header);
+  int retry_count = 0;
+  const int max_retries = 15;
+
+  // 1. Wait for full Ethernet + minimum IP header
+  while (!waitForBytes(min_ip_header_and_eth_size, frameCounter, "IP_HEADER")) {
     LOG_WARN("[Frame ", frameCounter, "] waitForBytes failed (attempt ",
              retry_count, ") while waiting for IP_HEADER. Will keep waiting.");
-
     if (retry_count >= max_retries) {
       LOG_ERROR("[Frame ", frameCounter,
                 "] Multiple waitForBytes failures for IP_HEADER. Returning "
                 "invalid packet.");
       info.valid = false;
-      info.alignedFrameSize = min_eth_header_alignment;
-      return info;
+      info.alignedFrameSize = MINIMAL_ALIGNED_ADVANCE_ON_ERROR;
+      return false;
     }
-
-    // unified backoff before retrying
     backoffDelay(retry_count);
   }
 
@@ -317,14 +328,14 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
               "] getReadPtr() returned nullptr after IP_HEADER wait! Returning "
               "invalid packet.");
     info.valid = false;
-    info.alignedFrameSize = min_eth_header_alignment;
-    return info;
+    info.alignedFrameSize = MINIMAL_ALIGNED_ADVANCE_ON_ERROR;
+    return false;
   }
-  info.ethHeader = reinterpret_cast<const EthernetHeader *>(info.rawDataStart);
+  // info.ethHeader is already set by parseEthernetHeader
   info.ipHeader = reinterpret_cast<const IPv4Header *>(info.rawDataStart +
                                                        sizeof(EthernetHeader));
 
-  // 5. Extract and Validate IP Header fields
+  // 2. Extract and Validate IP Header fields
   try {
     uint8_t ipVersion = info.ipHeader->versionAndIHL >> 4;
     info.ipHeaderLength = (info.ipHeader->versionAndIHL & 0x0F) * 4;
@@ -342,101 +353,115 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
       LOG_WARN("[Frame ", frameCounter,
                "] Skipping non-IPv4 packet (Version: ", ipVersion, ")");
       info.valid = false;
-      info.alignedFrameSize = min_eth_header_alignment; // Minimal advance
-      return info;
+      info.alignedFrameSize = MINIMAL_ALIGNED_ADVANCE_ON_ERROR;
+      return false;
     }
     if (info.ipHeaderLength < 20) { // Minimum IPv4 header size
       LOG_WARN("[Frame ", frameCounter,
                "] Skipping packet with invalid IP header length: ",
                info.ipHeaderLength);
       info.valid = false;
-      info.alignedFrameSize = min_eth_header_alignment; // Minimal advance
-      return info;
+      info.alignedFrameSize = MINIMAL_ALIGNED_ADVANCE_ON_ERROR;
+      return false;
     }
     if (info.ipTotalLength < info.ipHeaderLength) {
       LOG_WARN("[Frame ", frameCounter,
                "] Skipping packet with IP total length (", info.ipTotalLength,
                ") < IP header length (", info.ipHeaderLength, ").");
       info.valid = false;
-      info.alignedFrameSize = min_eth_header_alignment; // Minimal advance
-      return info;
+      info.alignedFrameSize = MINIMAL_ALIGNED_ADVANCE_ON_ERROR;
+      return false;
     }
-
-  } catch (const std::exception &e) { // Catch specific standard exceptions
+  } catch (const std::exception &e) {
     LOG_ERROR("[Frame ", frameCounter,
               "] Exception accessing IP Header fields: ", e.what(),
               " Returning invalid packet.");
     info.valid = false;
-    info.alignedFrameSize = min_eth_header_alignment;
-    return info;
+    info.alignedFrameSize = MINIMAL_ALIGNED_ADVANCE_ON_ERROR;
+    return false;
   } catch (...) {
     LOG_ERROR("[Frame ", frameCounter,
               "] Unknown exception accessing IP Header fields. Possible "
               "corrupted buffer. Returning invalid packet.");
     info.valid = false;
-    info.alignedFrameSize = min_eth_header_alignment;
-    return info;
+    info.alignedFrameSize = MINIMAL_ALIGNED_ADVANCE_ON_ERROR;
+    return false;
   }
 
-  // 6. Calculate required frame size and wait for it
-  info.frameSize = sizeof(EthernetHeader) + info.ipTotalLength; // no FCS added
+  // 3. Calculate required frame size for IP packet and wait for it
+  info.frameSize =
+      sizeof(EthernetHeader) + info.ipTotalLength + ETHERNET_FCS_LENGTH;
   info.alignedFrameSize = SharedQueue::align8(info.frameSize);
   LOG_TRACE("[Frame ", frameCounter, "] Calculated frameSize=", info.frameSize,
             ", alignedFrameSize=", info.alignedFrameSize);
 
   retry_count = 0;
-  while (!waitForBytes(info.frameSize, frameCounter, "FRAME_DATA")) {
+  while (!waitForBytes(info.alignedFrameSize, frameCounter, "FRAME_DATA")) {
     LOG_WARN("[Frame ", frameCounter, "] waitForBytes failed (attempt ",
-             retry_count, ") while waiting for FRAME_DATA (", info.frameSize,
-             " bytes). Will keep waiting.");
-
+             retry_count, ") while waiting for FRAME_DATA (",
+             info.alignedFrameSize, ") bytes). Will keep waiting.");
     if (retry_count >= max_retries) {
       LOG_ERROR("[Frame ", frameCounter,
-                "] Multiple waitForBytes failures for FRAME_DATA. Returning "
-                "invalid packet.");
+                "] Multiple waitForBytes failures for FRAME_DATA (expected ",
+                info.alignedFrameSize,
+                " bytes). Returning invalid packet but preserving expected "
+                "alignedFrameSize for queue advancement.");
       info.valid = false;
-      info.alignedFrameSize = min_eth_header_alignment;
-      return info;
+      // DO NOT change info.alignedFrameSize here. It was calculated based on
+      // ipTotalLength and should be used to advance the queue to skip this
+      // problematic frame.
+      return false;
     }
-
-    // unified backoff before retrying
     backoffDelay(retry_count);
   }
 
   info.bytesAvailableWhenParsed = inputQueue_->getReadableBytes();
 
-  // 7. Re-get pointers and extract UDP info (if applicable)
+  // Re-get pointers as buffer might have wrapped or more data arrived
   info.rawDataStart = inputQueue_->getReadPtr();
   if (!info.rawDataStart) {
     LOG_ERROR("[Frame ", frameCounter,
               "] getReadPtr() returned nullptr after frame data wait! "
               "Returning invalid packet.");
     info.valid = false;
-    info.alignedFrameSize = min_eth_header_alignment;
-    return info;
+    info.alignedFrameSize = MINIMAL_ALIGNED_ADVANCE_ON_ERROR;
+    return false;
   }
+  // info.ethHeader and info.ipHeader pointers need to be re-established based
+  // on the new rawDataStart
+  info.ethHeader = reinterpret_cast<const EthernetHeader *>(info.rawDataStart);
+  info.ipHeader = reinterpret_cast<const IPv4Header *>(info.rawDataStart +
+                                                       sizeof(EthernetHeader));
 
-  // 8. Check if this is from one of our target IPs
+  // 4. Check if this is from one of our target IPs
   info.isTargetIP =
       (info.sourceIP == snapshotIP_ || info.sourceIP == updateIP_);
 
   if (!info.isTargetIP) {
     LOG_TRACE("[Frame ", frameCounter, "] Skipping frame from non-target IP.");
-    info.valid = false; // Mark as skip
-    // Keep alignedFrameSize as calculated, since we waited for it
-    return info;
+    info.valid = false; // Mark as skip, but use the calculated alignedFrameSize
+    return false;       // Indicates packet should be skipped based on IP
   }
 
   if (info.ipProtocol != IPPROTO_UDP) {
     LOG_WARN("[Frame ", frameCounter,
              "] Skipping non-UDP packet from target IP (Proto: ",
              info.ipProtocol, ")");
-    info.valid = false; // Mark as skip
-    // Keep alignedFrameSize
-    return info;
+    info.valid = false; // Mark as skip, use calculated alignedFrameSize
+    return false;       // Indicates packet should be skipped
   }
 
-  // 9. Process UDP Header and extract payload
+  return true; // Successfully parsed IP header for a target UDP packet
+}
+
+bool FrameProcessor::parseUdpHeaderAndPayload(PacketInfo &info,
+                                              uint64_t frameCounter) {
+  const size_t MINIMAL_ALIGNED_ADVANCE_ON_ERROR =
+      SharedQueue::align8(sizeof(EthernetHeader)); // 16 bytes
+
+  // Assumes rawDataStart, ethHeader, ipHeader, ipHeaderLength are correctly set
+  // and validated by previous parsing steps.
+
   info.udpHeader = reinterpret_cast<const UDPHeader *>(
       info.rawDataStart + sizeof(EthernetHeader) + info.ipHeaderLength);
   uint16_t udpTotalLength = 0;
@@ -463,14 +488,12 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
             "] UDP payload length mismatch. UDP header: ", info.payloadLength,
             ", IP header implies: ", expectedUdpPayloadLength,
             ". Using UDP header length.");
-        // Potentially adjust info.payloadLength here if needed, but sticking to
-        // UDP header value
       }
 
       // Boundary check: Ensure payload doesn't read past the received frame
       // data
       const uint8_t *frameEndBasedOnIp =
-          info.rawDataStart + info.frameSize; // End of IP payload
+          info.rawDataStart + info.frameSize - ETHERNET_FCS_LENGTH;
       const uint8_t *payloadEnd = info.payload + info.payloadLength;
 
       if (payloadEnd > frameEndBasedOnIp) {
@@ -478,7 +501,6 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
                   (payloadEnd - info.rawDataStart),
                   ") exceeds IP frame boundary (size ", info.frameSize,
                   "). Clamping payload length.");
-        // Adjust payload length to prevent reading out of bounds
         ptrdiff_t rawMaxPayload = frameEndBasedOnIp - info.payload;
         size_t maxPayload =
             rawMaxPayload > 0 ? static_cast<size_t>(rawMaxPayload) : 0;
@@ -489,7 +511,7 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
         } else {
           LOG_WARN("[Frame ", frameCounter,
                    "] Payload length becomes 0 after clamping.");
-          info.payload = nullptr; // No valid payload
+          info.payload = nullptr;
         }
       }
     }
@@ -500,8 +522,8 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
     info.valid = false;
     info.alignedFrameSize = info.alignedFrameSize > 0
                                 ? info.alignedFrameSize
-                                : min_eth_header_alignment;
-    return info;
+                                : MINIMAL_ALIGNED_ADVANCE_ON_ERROR;
+    return false;
   } catch (...) {
     LOG_ERROR("[Frame ", frameCounter,
               "] Unknown exception accessing UDP Header/Payload. Possible "
@@ -509,8 +531,8 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
     info.valid = false;
     info.alignedFrameSize = info.alignedFrameSize > 0
                                 ? info.alignedFrameSize
-                                : min_eth_header_alignment;
-    return info;
+                                : MINIMAL_ALIGNED_ADVANCE_ON_ERROR;
+    return false;
   }
 
   // If we reached here with a valid payload, mark the packet as valid
@@ -520,7 +542,41 @@ FrameProcessor::parseNextPacket(uint64_t frameCounter) {
     LOG_DEBUG("[Frame ", frameCounter,
               "] Packet from target IP has no valid payload");
   }
+  return info.valid; // Returns true if payload is valid, false otherwise
+}
 
+// Helper function to parse the next packet from the input queue
+FrameProcessor::PacketInfo
+FrameProcessor::parseNextPacket(uint64_t frameCounter) {
+  PacketInfo info;
+  // MINIMAL_ALIGNED_ADVANCE_ON_ERROR is defined in each helper where needed.
+
+  // 1. Parse Ethernet Header and check EtherType
+  if (!parseEthernetHeader(info, frameCounter)) {
+    // info.valid and info.alignedFrameSize are set by parseEthernetHeader
+    // This path handles non-IP skips or critical Ethernet header errors.
+    return info;
+  }
+
+  // At this point, it's an IP packet. Proceed to parse IP header.
+  if (!parseIpHeader(info, frameCounter)) {
+    // info.valid and info.alignedFrameSize are set by parseIpHeader
+    // This path handles IP validation errors, non-target IPs, or non-UDP skips.
+    return info;
+  }
+
+  // At this point, it's a UDP packet from a target IP. Parse UDP header and get
+  // payload.
+  if (!parseUdpHeaderAndPayload(info, frameCounter)) {
+    // info.valid and info.alignedFrameSize are set by parseUdpHeaderAndPayload
+    // This path handles UDP parsing errors or empty/invalid payloads.
+    // Note: even if this returns false (payload not valid),
+    // info.alignedFrameSize should still be correct for advancing the queue
+    // based on IP packet length.
+    return info;
+  }
+
+  // If all parsing stages passed, info.valid should be true.
   return info;
 }
 
@@ -561,14 +617,16 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
   size_t headerSz = sizeof(count);
   size_t bodySz = count * 3 * sizeof(uint32_t);
   size_t totalSz = headerSz + bodySz;
+  // Pad total size to 8-byte boundary for shared-queue alignment
+  size_t paddedSz = SharedQueue::align8(totalSz);
 
   // Warn every WARN_LOG_INTERVAL backoff loops
   constexpr int WARN_LOG_INTERVAL = 1024;
   int backoff = 0;
-  while (!outputQueue_->canWrite(totalSz)) {
+  while (!outputQueue_->canWrite(paddedSz)) {
     if ((backoff % WARN_LOG_INTERVAL) == 0) {
       size_t free = outputQueue_->getWritableBytes();
-      LOG_WARN("[Frame ", frameCounter, "] backpressure: need ", totalSz,
+      LOG_WARN("[Frame ", frameCounter, "] backpressure: need ", paddedSz,
                " bytes, free ", free);
     }
     backoffDelay(backoff);
@@ -579,7 +637,7 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
   *reinterpret_cast<uint32_t *>(wptr) = count;
   wptr += headerSz;
   LOG_DEBUG("[Frame ", frameCounter, "] writing ", count, " entries (", totalSz,
-            " bytes)");
+            " bytes) padded to ", paddedSz);
 
   // Trace-only detailed logs
   if (COMPILE_TIME_LOG_LEVEL >= static_cast<int>(LogLevel::TRACE)) {
@@ -601,11 +659,15 @@ void FrameProcessor::writeOutput(bool isSnapshotOrError,
     wptr += sizeof(uint32_t);
   }
 
-  // Publish
-  outputQueue_->advanceProducer(totalSz);
+  // Zero out any padding beyond the real data
+  if (paddedSz > totalSz) {
+    std::memset(wptr, 0, paddedSz - totalSz);
+  }
+  // Publish padded size
+  outputQueue_->advanceProducer(paddedSz);
   orderbookManager_.clearChangedVWAPs();
   LOG_DEBUG("[Frame ", frameCounter, "] writeOutput done, wrote ", count,
-            " entries");
+            " entries, totalSz=", totalSz, ", paddedSz=", paddedSz);
 }
 
 // Helper function to process a valid packet's payload
@@ -675,10 +737,15 @@ void FrameProcessor::advanceInputQueue(const PacketInfo &packetInfo,
               currentOffset, " to ", newOffset,
               " (delta: ", (newOffset - currentOffset), ")");
   } else {
-    LOG_WARN("[Frame ", frameCounter,
-             "] Packet resulted in 0 alignedFrameSize (Likely non-IP or "
-             "invalid header). Advancing by minimum 8 bytes.");
-    inputQueue_->advanceConsumer(SharedQueue::align8(8));
+    LOG_ERROR(
+        "[Frame ", frameCounter,
+        "] CRITICAL: packetInfo.alignedFrameSize is non-positive (",
+        packetInfo.alignedFrameSize,
+        "). This indicates a severe parsing logic error in parseNextPacket. "
+        "Advancing by MINIMAL_ALIGNED_ADVANCE_ON_ERROR (",
+        MINIMAL_ALIGNED_ADVANCE_ON_ERROR,
+        " bytes) as a last resort. QUEUE WILL LIKELY MISALIGN.");
+    inputQueue_->advanceConsumer(MINIMAL_ALIGNED_ADVANCE_ON_ERROR);
     [[maybe_unused]] uint32_t newOffset =
         inputQueue_->header->consumer_offset.load(std::memory_order_relaxed);
     LOG_DEBUG("[Frame ", frameCounter, "] Consumer advanced from ",
@@ -705,9 +772,12 @@ void FrameProcessor::processSingleFrame(uint64_t frameCounter) {
   // 2. Handle invalid/skipped packets - write 0 to output and advance
   if (!packetInfo.valid) {
     LOG_DEBUG("[Frame ", frameCounter, "] Invalid packet, writing 0 to output");
-    writeOutput(true, frameCounter); // Write 0 for invalid packets
-    LOG_DEBUG("[Frame ", frameCounter, "] After writing 0, advancing queue");
+    LOG_DEBUG("[Frame ", frameCounter,
+              "] Advancing input queue before writing 0");
     advanceInputQueue(packetInfo, frameCounter);
+    LOG_DEBUG("[Frame ", frameCounter,
+              "] Writing 0 to output for invalid packet");
+    writeOutput(true, frameCounter); // Write 0 for invalid packets
     LOG_DEBUG("[Frame ", frameCounter,
               "] ----- End Processing (Invalid) -----");
     return;
@@ -725,10 +795,9 @@ void FrameProcessor::processSingleFrame(uint64_t frameCounter) {
   // 5. Write Output
   // Write 0 if it was a snapshot message OR unknown message type OR if a
   // processing error occurred
-  writeOutput(writeZeroMsgType || processingError, frameCounter);
-
-  // 6. Advance Input Queue Consumer
+  // First free input space before blocking on output
   advanceInputQueue(packetInfo, frameCounter);
+  writeOutput(writeZeroMsgType || processingError, frameCounter);
 }
 
 // Main processing loop for Queue mode
@@ -833,7 +902,7 @@ void FrameProcessor::runQueue() {
       // Write a zero to output to unblock runner and advance consumer minimally
       LOG_INFO("Writing emergency 0 to output after exception");
       writeOutput(true, frameCounter);
-      inputQueue_->advanceConsumer(SharedQueue::align8(8));
+      inputQueue_->advanceConsumer(MINIMAL_ALIGNED_ADVANCE_ON_ERROR);
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
         LOG_ERROR("Too many consecutive errors (", consecutiveErrors,
                   "), halting processing.");
@@ -860,7 +929,7 @@ void FrameProcessor::runQueue() {
       // Write a zero to output to unblock runner and advance consumer minimally
       LOG_INFO("Writing emergency 0 to output after unknown exception");
       writeOutput(true, frameCounter);
-      inputQueue_->advanceConsumer(SharedQueue::align8(8));
+      inputQueue_->advanceConsumer(MINIMAL_ALIGNED_ADVANCE_ON_ERROR);
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
         LOG_ERROR("Too many consecutive errors (", consecutiveErrors,
                   "), halting processing.");

@@ -90,13 +90,6 @@ public:
   void run();
 
 private:
-  // Backoff parameters for busy-wait loops
-  static constexpr int BACKOFF_SPIN_LIMIT = 50;
-  static constexpr int BACKOFF_YIELD_LIMIT = 100;
-
-  // Helper to apply unified spin/yield/sleep backoff
-  static void backoffDelay(int &counter);
-
   // --- Helper Struct for Parsed Packet Data ---
   struct PacketInfo {
     bool valid =
@@ -171,4 +164,20 @@ private:
 
   // Helper to convert IP string to uint32_t
   uint32_t ipStringToUint32(const std::string &ip_str);
+
+  // --- New private helper methods for parsing different packet layers ---
+  // Parses the Ethernet header. Returns true if successful, false otherwise.
+  // Sets info.valid and info.alignedFrameSize appropriately on failure/skip.
+  bool parseEthernetHeader(PacketInfo &info, uint64_t frameCounter);
+
+  // Parses the IP header. Returns true if successful, false otherwise.
+  // Assumes Ethernet header has been successfully parsed.
+  // Sets info.valid and info.alignedFrameSize appropriately on failure/skip.
+  bool parseIpHeader(PacketInfo &info, uint64_t frameCounter);
+
+  // Parses the UDP header and extracts payload. Returns true if successful,
+  // false otherwise. Assumes IP header has been successfully parsed and
+  // protocol is UDP. Sets info.valid and info.alignedFrameSize appropriately on
+  // failure/skip.
+  bool parseUdpHeaderAndPayload(PacketInfo &info, uint64_t frameCounter);
 };
